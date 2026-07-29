@@ -28,6 +28,7 @@ class FakeClient:
 async def test_generate_coaching_returns_structured_schedule(monkeypatch):
     payload = (
         '{"progress_assessment": "You are on track.", '
+        '"session_summary": "Session summary: saving steadily.", '
         '"deposit_schedule": ['
         '{"date": "2026-06-15", "amount_usdc": 100, "note": "First deposit"}], '
         '"nudges": ["Great start!"], "confidence": "high"}'
@@ -52,3 +53,5 @@ async def test_generate_coaching_returns_structured_schedule(monkeypatch):
     assert len(result.deposit_schedule) == 1
     assert result.deposit_schedule[0].amount_usdc == 100
     assert "on track" in result.progress_assessment
+    assert "saving steadily" in result.session_summary
+

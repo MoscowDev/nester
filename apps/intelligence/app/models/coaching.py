@@ -38,3 +38,5 @@ class CoachingResponse(BaseModel):
     deposit_schedule: list[DepositScheduleItem]
     nudges: list[str]
     confidence: str = "medium"
+    session_summary: str = ""
+

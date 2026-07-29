@@ -652,11 +652,12 @@ async def generate_coaching(
                 deposit_schedule=[],
                 nudges=[],
                 confidence="low",
+                session_summary=guardrails.REFUSAL_MESSAGE,
             )
 
     schema = (
-        '{"progress_assessment": str, "deposit_schedule": '
-        '[{"date": str, "amount_usdc": float, "note": str}], '
+        '{"progress_assessment": str, "session_summary": str, '
+        '"deposit_schedule": [{"date": str, "amount_usdc": float, "note": str}], '
         '"nudges": [str], "confidence": "high"|"medium"|"low"}'
     )
     vaults_preview = json.dumps(portfolio.vaults[:5])
@@ -668,7 +669,7 @@ async def generate_coaching(
         f"Current progress: {goal.progress_pct:.1f}% ({goal.current_amount} saved). "
         f"Portfolio total USD: {portfolio.total_balance_usd}. Vaults: {vaults_preview}. "
         "Return a realistic deposit schedule from today until the deadline, with 3-8 installments. "
-        "Include a short progress assessment and 2-3 motivational nudges. "
+        "Include a short progress assessment, a concise 1-2 sentence session summary for savings goal notes, and 2-3 motivational nudges. "
         f"Respond with JSON only matching: {schema}"
     )
     client = get_client()
@@ -702,28 +703,38 @@ async def generate_coaching(
             )
             for item in parsed.get("deposit_schedule", [])
         ]
+        progress = guardrails.strip_system_prompt_leakage(
+            str(parsed.get("progress_assessment", "")), request_id=request_id
+        )
+        summary_raw = str(parsed.get("session_summary", "")).strip()
+        summary = (
+            guardrails.strip_system_prompt_leakage(summary_raw, request_id=request_id)
+            if summary_raw
+            else progress
+        )
         return CoachingResponse(
-            progress_assessment=guardrails.strip_system_prompt_leakage(
-                str(parsed.get("progress_assessment", "")), request_id=request_id
-            ),
+            progress_assessment=progress,
             deposit_schedule=schedule,
             nudges=[
                 guardrails.strip_system_prompt_leakage(str(n), request_id=request_id)
                 for n in parsed.get("nudges", [])
             ],
             confidence=str(parsed.get("confidence", "medium")),
+            session_summary=summary,
         )
     except Exception:
         logger.exception("coaching generation failed")
         remaining = max(goal.target_amount - goal.current_amount, 0)
+        fallback_assessment = (
+            f"You are {goal.progress_pct:.0f}% toward your goal. "
+            f"About {remaining:.0f} {goal.currency} left to save."
+        )
         return CoachingResponse(
-            progress_assessment=(
-                f"You are {goal.progress_pct:.0f}% toward your goal. "
-                f"About {remaining:.0f} {goal.currency} left to save."
-            ),
+            progress_assessment=fallback_assessment,
             deposit_schedule=[],
             nudges=["Keep making steady deposits to stay on track."],
             confidence="low",
+            session_summary=fallback_assessment,
         )
 
 
