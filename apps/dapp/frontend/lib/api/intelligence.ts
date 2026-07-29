@@ -88,6 +88,7 @@ export interface MarketContextSignal {
 }
 
 export interface PortfolioInsight {
+  id?: string
   title: string
   body: string
   confidence: number
