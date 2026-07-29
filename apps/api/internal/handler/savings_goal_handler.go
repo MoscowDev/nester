@@ -29,6 +29,7 @@ type SavingsGoalManager interface {
 	ListPaginated(ctx context.Context, userID uuid.UUID, filter service.SavingsGoalListFilter) ([]savingsgoal.SavingsGoal, int, error)
 	Update(ctx context.Context, userID, goalID uuid.UUID, in service.UpdateSavingsGoalInput) (savingsgoal.SavingsGoal, error)
 	Delete(ctx context.Context, userID, goalID uuid.UUID) error
+	Restore(ctx context.Context, userID, goalID uuid.UUID) (savingsgoal.SavingsGoal, error)
 	Summary(ctx context.Context, userID uuid.UUID) (savingsgoal.SavingsGoalsSummary, error)
 	Pause(ctx context.Context, userID, goalID uuid.UUID) (savingsgoal.SavingsGoal, error)
 	Resume(ctx context.Context, userID, goalID uuid.UUID) (savingsgoal.SavingsGoal, error)
@@ -77,6 +78,8 @@ func (h *SavingsGoalHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/users/savings-goals/{id}", h.get)
 	mux.HandleFunc("PATCH /api/v1/users/savings-goals/{id}", h.update)
 	mux.HandleFunc("DELETE /api/v1/users/savings-goals/{id}", h.delete)
+	// #924 soft-delete recovery
+	mux.HandleFunc("POST /api/v1/users/savings-goals/{id}/restore", h.restore)
 	// #718 pause/resume
 	mux.HandleFunc("PATCH /api/v1/users/savings-goals/{id}/pause", h.pause)
 	mux.HandleFunc("PATCH /api/v1/users/savings-goals/{id}/resume", h.resume)
@@ -101,24 +104,28 @@ func (h *SavingsGoalHandler) Register(mux *http.ServeMux) {
 }
 
 type createSavingsGoalRequest struct {
-	TargetAmount json.Number `json:"target_amount"`
-	Currency     string      `json:"currency"`
-	Deadline     string      `json:"deadline"`
-	Description  string      `json:"description"`
-	Category     string      `json:"category"`
-	Name         string      `json:"name"`
-	Emoji        string      `json:"emoji"`
-	VaultID      *string     `json:"vault_id,omitempty"`
+	TargetAmount    json.Number  `json:"target_amount"`
+	Currency        string       `json:"currency"`
+	Deadline        string       `json:"deadline"`
+	Description     string       `json:"description"`
+	Category        string       `json:"category"`
+	Name            string       `json:"name"`
+	Emoji           string       `json:"emoji"`
+	VaultID         *string      `json:"vault_id,omitempty"`
+	MinContribution *json.Number `json:"min_contribution,omitempty"`
+	MaxContribution *json.Number `json:"max_contribution,omitempty"`
 }
 
 type updateSavingsGoalRequest struct {
-	TargetAmount *json.Number `json:"target_amount"`
-	Currency     *string      `json:"currency"`
-	Deadline     *string      `json:"deadline"`
-	Description  *string      `json:"description"`
-	Category     *string      `json:"category"`
-	Name         *string      `json:"name"`
-	Emoji        *string      `json:"emoji"`
+	TargetAmount    *json.Number `json:"target_amount"`
+	Currency        *string      `json:"currency"`
+	Deadline        *string      `json:"deadline"`
+	Description     *string      `json:"description"`
+	Category        *string      `json:"category"`
+	Name            *string      `json:"name"`
+	Emoji           *string      `json:"emoji"`
+	MinContribution *json.Number `json:"min_contribution,omitempty"`
+	MaxContribution *json.Number `json:"max_contribution,omitempty"`
 }
 
 func (h *SavingsGoalHandler) create(w http.ResponseWriter, r *http.Request) {
@@ -151,15 +158,27 @@ func (h *SavingsGoalHandler) create(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("vault_id must be a valid UUID"))
 		return
 	}
+	minContribution, err := parseOptionalDecimal(req.MinContribution)
+	if err != nil {
+		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("min_contribution must be a valid number"))
+		return
+	}
+	maxContribution, err := parseOptionalDecimal(req.MaxContribution)
+	if err != nil {
+		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("max_contribution must be a valid number"))
+		return
+	}
 	goal, err := h.svc.Create(r.Context(), userID, service.CreateSavingsGoalInput{
-		TargetAmount: target,
-		Currency:     req.Currency,
-		Deadline:     deadline,
-		Description:  req.Description,
-		Category:     req.Category,
-		Name:         req.Name,
-		Emoji:        req.Emoji,
-		VaultID:      vaultID,
+		TargetAmount:    target,
+		Currency:        req.Currency,
+		Deadline:        deadline,
+		Description:     req.Description,
+		Category:        req.Category,
+		Name:            req.Name,
+		Emoji:           req.Emoji,
+		VaultID:         vaultID,
+		MinContribution: minContribution,
+		MaxContribution: maxContribution,
 	})
 	if err != nil {
 		h.writeError(w, r, err)
@@ -406,6 +425,18 @@ func (h *SavingsGoalHandler) update(w http.ResponseWriter, r *http.Request) {
 	in.Category = req.Category
 	in.Name = req.Name
 	in.Emoji = req.Emoji
+	minContribution, err := parseOptionalDecimal(req.MinContribution)
+	if err != nil {
+		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("min_contribution must be a valid number"))
+		return
+	}
+	maxContribution, err := parseOptionalDecimal(req.MaxContribution)
+	if err != nil {
+		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("max_contribution must be a valid number"))
+		return
+	}
+	in.MinContribution = minContribution
+	in.MaxContribution = maxContribution
 
 	goal, err := h.svc.Update(r.Context(), userID, goalID, in)
 	if err != nil {
@@ -430,6 +461,25 @@ func (h *SavingsGoalHandler) delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// restore undoes a soft delete within the recovery window (#924).
+func (h *SavingsGoalHandler) restore(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.authenticatedUserID(w, r)
+	if !ok {
+		return
+	}
+	goalID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("goal id must be a valid UUID"))
+		return
+	}
+	goal, err := h.svc.Restore(r.Context(), userID, goalID)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	response.WriteJSON(w, http.StatusOK, response.OK(goal))
 }
 
 func (h *SavingsGoalHandler) pause(w http.ResponseWriter, r *http.Request) {
@@ -659,11 +709,19 @@ func (h *SavingsGoalHandler) writeError(w http.ResponseWriter, r *http.Request, 
 		response.WriteJSON(w, http.StatusConflict, response.Err(http.StatusConflict, "GOAL_PAUSED", err.Error()))
 	case errors.Is(err, savingsgoal.ErrGoalArchived):
 		response.WriteJSON(w, http.StatusConflict, response.Err(http.StatusConflict, "GOAL_ARCHIVED", err.Error()))
+	case errors.Is(err, savingsgoal.ErrGoalNotDeleted):
+		response.WriteJSON(w, http.StatusConflict, response.Err(http.StatusConflict, "GOAL_NOT_DELETED", err.Error()))
+	case errors.Is(err, savingsgoal.ErrRecoveryWindowExpired):
+		response.WriteJSON(w, http.StatusConflict, response.Err(http.StatusConflict, "RECOVERY_WINDOW_EXPIRED", err.Error()))
 	case errors.Is(err, savingsgoal.ErrUnauthorized):
 		response.WriteJSON(w, http.StatusForbidden, response.Err(http.StatusForbidden, "FORBIDDEN", "vault does not belong to you"))
 	case errors.Is(err, savingsgoal.ErrInvalidGoal):
 		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr(err.Error()))
 	case errors.Is(err, savingsgoal.ErrInvalidAmount):
+		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr(err.Error()))
+	case errors.Is(err, savingsgoal.ErrInvalidContributionLimits):
+		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr(err.Error()))
+	case errors.Is(err, savingsgoal.ErrContributionOutOfRange):
 		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr(err.Error()))
 	default:
 		logpkg.FromContext(r.Context()).Error("savings goal handler failed", "error", err.Error())
@@ -690,6 +748,19 @@ func parseTargetAmount(n json.Number) (decimal.Decimal, error) {
 		return decimal.Zero, err
 	}
 	return decimal.NewFromFloat(f), nil
+}
+
+// parseOptionalDecimal parses an optional per-contribution limit (#922),
+// treating an absent field as "not provided" (nil, nil).
+func parseOptionalDecimal(n *json.Number) (*decimal.Decimal, error) {
+	if n == nil {
+		return nil, nil
+	}
+	amount, err := parseTargetAmount(*n)
+	if err != nil {
+		return nil, err
+	}
+	return &amount, nil
 }
 
 func readJSONBody(r *http.Request) ([]byte, error) {

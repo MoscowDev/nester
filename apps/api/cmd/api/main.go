@@ -183,6 +183,9 @@ func run() error {
 
 	userRepository := postgres.NewUserRepository(db)
 	userService := service.NewUserService(userRepository)
+	if accountCipher != nil {
+		userService.WithCipher(accountCipher)
+	}
 	userHandler := handler.NewUserHandler(userService)
 	userVaultsSvc := service.NewUserVaultsService(vaultRepository)
 	userHandler.SetUserVaultsService(userVaultsSvc)
@@ -194,6 +197,7 @@ func run() error {
 	settlementHandler := handler.NewSettlementHandler(settlementService, userService)
 
 	adminRepository := postgres.NewAdminRepository(db)
+	goalTemplateRepo := postgres.NewGoalTemplateRepository(db)
 
 	var chainInvoker service.VaultChainInvoker
 	if secret := cfg.Stellar().OperatorSecret(); secret != "" {
@@ -220,6 +224,7 @@ func run() error {
 		cfg.Stellar().AllocationStrategyAddress(),
 		cfg.Allocation().MinWeightPercent(),
 	)
+	adminService.SetTemplateRepository(goalTemplateRepo)
 	adminHandler := handler.NewAdminHandler(adminService, userService)
 	adminHandler.SetEventSyncer(&stellarpkg.EventSyncer{
 		DB:      db,
@@ -262,6 +267,11 @@ func run() error {
 	oracleService := oracle.NewRateService(cfg.Stellar().HorizonURL(), cfg.Stellar().USDCIssuer())
 	rateHandler := handler.NewRateHandler(oracleService)
 
+	// maxWSConnsPerIP bounds simultaneous WebSocket connections from one
+	// client IP (nester#828), mirroring the per-route rate limits already
+	// applied via middleware.NewLimiter below. 0 would mean unlimited.
+	const maxWSConnsPerIP = 20
+
 	wsHub := ws.NewHub(baseLogger.WithGroup("websocket"), func(token string) (userID, sessionID string, err error) {
 		if token == "" {
 			return "", "", fmt.Errorf("missing token")
@@ -280,7 +290,7 @@ func run() error {
 			}
 		}
 		return claims.Subject, claims.SessionID, nil
-	}, cfg.AllowedOrigins())
+	}, cfg.AllowedOrigins(), redisClient, maxWSConnsPerIP)
 
 	wsCtx, wsCancel := context.WithCancel(context.Background())
 	defer wsCancel()
@@ -311,9 +321,17 @@ func run() error {
 	performanceService := performancesvc.NewService(performanceRepository, vaultRepository)
 	performanceHandler := handler.NewPerformanceHandler(performanceService, handler.NewVaultOwnerAdapter(vaultRepository))
 
-	// Projection service for compound interest calculations
+	// Projection service for compound interest calculations, plus the Monte
+	// Carlo savings forecast (#843), which needs the goal/schedule repos to
+	// ground contribution behavior in the user's own history.
 	projectionCalculator := service.NewCompoundInterestCalculator()
-	projectionService := service.NewProjectionService(projectionCalculator, vaultRepository, performanceRepository)
+	projectionService := service.NewProjectionService(
+		projectionCalculator,
+		vaultRepository,
+		performanceRepository,
+		postgres.NewSavingsGoalRepository(db),
+		postgres.NewSavingsScheduleRepository(db),
+	)
 	projectionHandler := handler.NewProjectionHandler(projectionService)
 
 	contractReader := stellarpkg.NewContractReader(
@@ -420,12 +438,47 @@ func run() error {
 	defer cancelPoller()
 	go txPoller.Run(pollerCtx)
 
+	// notificationRateLimit/-Window bound how many notifications a user can
+	// receive per category in a burst (#829's "a burst of deposits does not
+	// produce a burst of near-identical notifications"). Safety-category
+	// events bypass this entirely (see notifications.Category doc comment).
+	const notificationRateLimit = 20
+	const notificationRateWindow = 5 * time.Minute
+	notificationRateLimiter := middleware.NewLimiter(redisClient, "notifications", notificationRateLimit, notificationRateWindow)
+
+	// notificationDedup is process-local when Redis isn't configured, and
+	// Redis-backed (cross-instance) otherwise — same dual-mode pattern as
+	// middleware.NewLimiter above.
+	var notificationDedup notifications.Deduplicator = notifications.NewInMemoryDeduplicator()
+	if redisClient != nil {
+		notificationDedup = notifications.NewRedisDeduplicator(redisClient)
+	}
+
 	notificationDispatcher := notifications.New(
 		[]notifications.Channel{
-			// notifications.NewWebSocketChannel(wsHub), // TODO: Fix interface implementation
+			notifications.NewWebSocketChannel(wsHub),
 		},
 		notificationRepository,
 		nil,
+		notifications.WithDeduplicator(notificationDedup),
+		notifications.WithRateLimiter(notificationRateLimiter),
+	)
+
+	// notificationDispatcher2 carries the real Push channel — separate from
+	// notificationDispatcher above (WebSocket-only) because a failed
+	// WebSocket delivery is never retried by design (see
+	// notifications.RetryEnqueuer's doc comment), while a failed Push send
+	// is. NoopPushSender is the same placeholder nudgeNotificationDispatcher
+	// already uses below — a real provider integration is deliberately
+	// deferred (see #829's commit message).
+	notificationDispatcher2 := notifications.New(
+		[]notifications.Channel{
+			notifications.NewPushChannel(notifications.NoopPushSender{}, notificationRepository),
+		},
+		notificationRepository,
+		nil,
+		notifications.WithDeduplicator(notificationDedup),
+		notifications.WithRateLimiter(notificationRateLimiter),
 	)
 
 	var ready atomic.Bool
@@ -598,6 +651,8 @@ func run() error {
 		},
 		notificationRepository,
 		nil,
+		notifications.WithDeduplicator(notificationDedup),
+		notifications.WithRateLimiter(notificationRateLimiter),
 	)
 
 	nudgeEngineSvc = service.NewNudgeEngineService(
@@ -645,6 +700,7 @@ func run() error {
 	savingsGoalSvc.SetOutcomeRecorder(nudgeOutcomeService)
 	savingsGoalSvc.SetStreakRepository(savingsStreakRepo)
 	savingsGoalSvc.SetStreakNotifier(service.NudgeEngineStreakMilestoneNotifier{NudgeEngine: nudgeEngineSvc})
+	savingsGoalSvc.SetTemplateRepository(goalTemplateRepo)
 
 	minDeposit, _ := decimal.NewFromString(cfg.RecurringDeposit().MinDepositAmount())
 	savingsScheduleRepo := postgres.NewSavingsScheduleRepository(db)
@@ -672,6 +728,16 @@ func run() error {
 	jobQueueMetrics := jobqueue.NewStdMetrics()
 	jobQueueClient := jobqueue.NewClient(jobQueueRepo, jobQueueMetrics)
 
+	// Durable retry for failed notification deliveries (#829), now that the
+	// job queue client exists. Only notificationDispatcher2 gets a
+	// RetryEnqueuer: it's the only one of the two dispatchers above with a
+	// real Push channel registered. notificationDispatcher only has
+	// WebSocket registered, and WebSocket failures are never retried by
+	// design (see notifications.RetryEnqueuer's doc comment) — wiring retry
+	// there would only ever enqueue jobs for Email/Push that it has no
+	// adapter to actually redeliver.
+	notificationDispatcher2.SetRetryEnqueuer(notifications.NewJobQueueRetryEnqueuer(jobQueueClient))
+
 	// Recurring deposit sweep (#846): classified SINGLETON (money-moving —
 	// see RecurringDepositJob's doc comment). The sweep loop itself only
 	// enqueues a durable per-occurrence job onto jobQueueClient rather than
@@ -692,6 +758,19 @@ func run() error {
 	recurringCtx, cancelRecurring := context.WithCancel(context.Background())
 	defer cancelRecurring()
 	go recurringDepositJob.Run(recurringCtx)
+
+	// Savings goal soft-delete recovery purge (#924): hard-deletes goals
+	// whose deleted_at is older than savingsgoal.SavingsGoalRecoveryWindow.
+	// Runs daily; leader-elected like the other sweep jobs to avoid every
+	// instance racing to purge the same rows.
+	savingsGoalPurgeJob := scheduler.NewSavingsGoalPurgeJob(
+		savingsGoalRepo,
+		baseLogger.WithGroup("savings-goal-purge"),
+	)
+	savingsGoalPurgeJob.SetLeaderChecker(schedulerLeadership)
+	savingsGoalPurgeCtx, cancelSavingsGoalPurge := context.WithCancel(context.Background())
+	defer cancelSavingsGoalPurge()
+	go savingsGoalPurgeJob.Run(savingsGoalPurgeCtx, 24*time.Hour)
 
 	jobWorker := jobqueue.NewWorker(
 		jobQueueRepo,
@@ -727,6 +806,12 @@ func run() error {
 	harvestExecutor := harvest.NewServiceExecutor(vaultService, userService)
 	jobWorker.Register(harvest.DefaultJobType,
 		harvest.NewJobHandler(harvestExecutor, baseLogger.WithGroup("harvest-job")), 0)
+
+	// Notification retry (#829): redelivers a failed Push notification via
+	// notificationDispatcher2 (see the RetryEnqueuer wiring above for why
+	// only that dispatcher is used here).
+	jobWorker.Register(notifications.NotificationRetryJobType,
+		notifications.NewNotificationRetryJobHandler(notificationDispatcher2), 0)
 
 	// Recurring-deposit occurrence handler (#846): processes the jobs
 	// recurringDepositJob (above) enqueues. Fixes the #846 idempotency bug —
@@ -787,6 +872,7 @@ func run() error {
 		prometheusClient,
 		nudgeNotificationDispatcher,
 		baseLogger.WithGroup("goal-coaching"),
+		nudgeHistoryRepo,
 	)
 	goalCoachingCtx, cancelGoalCoaching := context.WithCancel(context.Background())
 	defer cancelGoalCoaching()

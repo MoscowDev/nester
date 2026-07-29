@@ -85,6 +85,10 @@ type CreateSavingsGoalInput struct {
 	Name         string          `json:"name"`
 	Emoji        string          `json:"emoji"`
 	VaultID      *uuid.UUID      `json:"vault_id,omitempty"`
+	// MinContribution/MaxContribution are optional per-contribution limits
+	// (#922) enforced at deposit time.
+	MinContribution *decimal.Decimal `json:"min_contribution,omitempty"`
+	MaxContribution *decimal.Decimal `json:"max_contribution,omitempty"`
 }
 
 type UpdateSavingsGoalInput struct {
@@ -95,6 +99,13 @@ type UpdateSavingsGoalInput struct {
 	Category     *string          `json:"category"`
 	Name         *string          `json:"name"`
 	Emoji        *string          `json:"emoji"`
+	// MinContribution/MaxContribution update a goal's per-contribution
+	// limits (#922) when non-nil. Setting either to a zero decimal (rather
+	// than leaving it nil) clears that limit.
+	MinContribution    *decimal.Decimal `json:"min_contribution,omitempty"`
+	MaxContribution    *decimal.Decimal `json:"max_contribution,omitempty"`
+	ClearMinContribution bool `json:"-"`
+	ClearMaxContribution bool `json:"-"`
 }
 
 func (s *SavingsGoalService) Create(ctx context.Context, userID uuid.UUID, in CreateSavingsGoalInput) (savingsgoal.SavingsGoal, error) {
@@ -125,16 +136,21 @@ func (s *SavingsGoalService) Create(ctx context.Context, userID uuid.UUID, in Cr
 			name = desc
 		}
 	}
+	if err := savingsgoal.ValidateContributionLimits(in.MinContribution, in.MaxContribution); err != nil {
+		return savingsgoal.SavingsGoal{}, err
+	}
 	goal := &savingsgoal.SavingsGoal{
-		ID:           uuid.New(),
-		UserID:       userID,
-		TargetAmount: in.TargetAmount,
-		Currency:     savingsgoal.NormalizeCurrency(in.Currency),
-		Deadline:     in.Deadline.UTC(),
-		Description:  desc,
-		Name:         name,
-		Emoji:        emoji,
-		Category:     category,
+		ID:              uuid.New(),
+		UserID:          userID,
+		TargetAmount:    in.TargetAmount,
+		Currency:        savingsgoal.NormalizeCurrency(in.Currency),
+		Deadline:        in.Deadline.UTC(),
+		Description:     desc,
+		Name:            name,
+		Emoji:           emoji,
+		Category:        category,
+		MinContribution: in.MinContribution,
+		MaxContribution: in.MaxContribution,
 	}
 	if in.VaultID != nil {
 		if err := s.validateGoalVault(ctx, userID, *in.VaultID, goal.Currency); err != nil {
@@ -408,6 +424,19 @@ func (s *SavingsGoalService) Update(ctx context.Context, userID, goalID uuid.UUI
 		}
 		goal.Emoji = e
 	}
+	if in.ClearMinContribution {
+		goal.MinContribution = nil
+	} else if in.MinContribution != nil {
+		goal.MinContribution = in.MinContribution
+	}
+	if in.ClearMaxContribution {
+		goal.MaxContribution = nil
+	} else if in.MaxContribution != nil {
+		goal.MaxContribution = in.MaxContribution
+	}
+	if err := savingsgoal.ValidateContributionLimits(goal.MinContribution, goal.MaxContribution); err != nil {
+		return savingsgoal.SavingsGoal{}, err
+	}
 	// Deadline is validated above (when changed); only amount/currency here, so
 	// other fields of an overdue goal can still be updated.
 	if err := validateSavingsGoalInput(goal.TargetAmount, goal.Currency); err != nil {
@@ -419,8 +448,37 @@ func (s *SavingsGoalService) Update(ctx context.Context, userID, goalID uuid.UUI
 	return s.EnrichProgress(ctx, *goal)
 }
 
+// Delete soft-deletes the goal (#924): it stamps deleted_at rather than
+// destroying the row, leaving a SavingsGoalRecoveryWindow-long window during
+// which Restore can undo it before the scheduled purge job hard-deletes it.
 func (s *SavingsGoalService) Delete(ctx context.Context, userID, goalID uuid.UUID) error {
 	return s.repo.Delete(ctx, goalID, userID)
+}
+
+// Restore undoes a soft delete (#924), provided the goal was deleted less
+// than SavingsGoalRecoveryWindow ago. Returns ErrGoalNotFound if the goal
+// doesn't exist or isn't owned by userID, ErrGoalNotDeleted if it was never
+// deleted, and ErrRecoveryWindowExpired once the window has elapsed (the
+// goal may already be gone, or about to be purged).
+func (s *SavingsGoalService) Restore(ctx context.Context, userID, goalID uuid.UUID) (savingsgoal.SavingsGoal, error) {
+	goal, err := s.repo.GetByIDIncludingDeleted(ctx, goalID)
+	if err != nil {
+		return savingsgoal.SavingsGoal{}, err
+	}
+	if goal.UserID != userID {
+		return savingsgoal.SavingsGoal{}, savingsgoal.ErrGoalNotFound
+	}
+	if goal.DeletedAt == nil {
+		return savingsgoal.SavingsGoal{}, savingsgoal.ErrGoalNotDeleted
+	}
+	if time.Since(*goal.DeletedAt) > savingsgoal.SavingsGoalRecoveryWindow {
+		return savingsgoal.SavingsGoal{}, savingsgoal.ErrRecoveryWindowExpired
+	}
+	if err := s.repo.Restore(ctx, goalID, userID); err != nil {
+		return savingsgoal.SavingsGoal{}, err
+	}
+	goal.DeletedAt = nil
+	return s.EnrichProgress(ctx, *goal)
 }
 
 func (s *SavingsGoalService) ListContributions(ctx context.Context, userID, goalID uuid.UUID, params listquery.PageParams) ([]savingsgoal.GoalContribution, int, string, error) {
@@ -1000,6 +1058,14 @@ func (s *SavingsGoalService) DepositSplit(ctx context.Context, userID uuid.UUID,
 			return SplitDepositResult{}, fmt.Errorf("%w: goal %s is archived", savingsgoal.ErrGoalArchived, a.GoalID)
 		}
 		goals[i] = g
+	}
+
+	// Enforce each goal's optional per-contribution limits (#922) against the
+	// amount it is about to receive.
+	for i, g := range goals {
+		if err := savingsgoal.ValidateContributionAmount(amounts[i], g.MinContribution, g.MaxContribution); err != nil {
+			return SplitDepositResult{}, fmt.Errorf("goal %s: %w", g.ID, err)
+		}
 	}
 
 	// Build deposit records and persist atomically.
