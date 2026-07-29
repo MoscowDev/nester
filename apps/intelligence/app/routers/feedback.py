@@ -20,7 +20,8 @@ from app.models.feedback import (
     FeedbackRequest,
     FeedbackResponse,
 )
-from app.services.feedback_store import FeedbackEntryDict, store as feedback_store
+from app.services.feedback_store import FeedbackEntryDict
+from app.services.feedback_store import store as feedback_store
 
 router = APIRouter(dependencies=[Depends(verify_jwt)])
 
