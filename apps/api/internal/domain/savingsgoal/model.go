@@ -37,6 +37,13 @@ var (
 	// ErrContributionOutOfRange is returned when a deposit amount falls
 	// outside a goal's configured min/max per-contribution limits (#922).
 	ErrContributionOutOfRange = errors.New("contribution amount outside allowed range")
+	// ErrGoalNotDeleted is returned by Restore when the goal has no deleted_at
+	// set (#924): nothing to restore.
+	ErrGoalNotDeleted = errors.New("savings goal is not deleted")
+	// ErrRecoveryWindowExpired is returned by Restore when the goal was
+	// deleted more than SavingsGoalRecoveryWindow ago (#924): it may already
+	// have been (or is about to be) permanently purged.
+	ErrRecoveryWindowExpired = errors.New("savings goal recovery window has expired")
 )
 
 // SavingsGoalRecoveryWindow is how long a soft-deleted savings goal (#924)
@@ -267,10 +274,17 @@ type SavingsGoal struct {
 	ShareToken     *uuid.UUID `json:"share_token,omitempty"`
 	ShareEnabledAt *time.Time `json:"share_enabled_at,omitempty"`
 	IsShared       bool       `json:"is_shared"`
+	// AutoCompound controls whether harvested yield is routed back into the
+	// goal's vault position (true, the default) or credited to YieldBalance
+	// instead of being reinvested (false).
+	AutoCompound bool `json:"auto_compound"`
+	// YieldBalance accumulates harvested yield that was NOT compounded because
+	// AutoCompound is false. It is held separately from CurrentAmount/vault balance.
+	YieldBalance decimal.Decimal `json:"yield_balance"`
 	// On-chain linkage (#807). OnchainGoalID is nil until asynchronous
 	// registration against the savings_goal contract succeeds.
-	OnchainGoalID  *string `json:"onchain_goal_id,omitempty"`
-	OnchainStatus  *string `json:"onchain_status,omitempty"`
+	OnchainGoalID *string `json:"onchain_goal_id,omitempty"`
+	OnchainStatus *string `json:"onchain_status,omitempty"`
 	// MinContribution/MaxContribution are optional per-contribution limits
 	// (#922), useful for merchants/employers seeding structured savings
 	// plans (e.g. "at least $50 per deposit" or "no more than $500 per
@@ -278,6 +292,11 @@ type SavingsGoal struct {
 	// by ValidateContributionAmount.
 	MinContribution *decimal.Decimal `json:"min_contribution,omitempty"`
 	MaxContribution *decimal.Decimal `json:"max_contribution,omitempty"`
+	// DeletedAt is set when the user deletes the goal (#924). The goal is
+	// hidden from all normal reads while set, but remains restorable via
+	// Restore until SavingsGoalRecoveryWindow elapses, after which the
+	// scheduled purge job hard-deletes it.
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
 }
 
 // SharedGoalView is the read-only public projection of a savings goal exposed
@@ -341,6 +360,12 @@ type Repository interface {
 	ClearShareToken(ctx context.Context, goalID, userID uuid.UUID) error
 	// GetByShareToken returns the goal whose share_token matches. Returns ErrGoalNotFound if none.
 	GetByShareToken(ctx context.Context, token uuid.UUID) (*SavingsGoal, error)
+	// GetByVaultID returns the goal linked to the given vault, if any. Returns
+	// ErrGoalNotFound if no goal links to that vault.
+	GetByVaultID(ctx context.Context, vaultID uuid.UUID) (*SavingsGoal, error)
+	// CreditYieldBalance atomically adds amount to the goal's yield_balance,
+	// used when harvested yield is not auto-compounded back into the vault.
+	CreditYieldBalance(ctx context.Context, goalID uuid.UUID, amount decimal.Decimal) error
 	// UpdateOnchainLink persists the result of asynchronously registering the
 	// goal against the savings_goal contract (#807).
 	UpdateOnchainLink(ctx context.Context, goalID uuid.UUID, onchainGoalID, onchainStatus string) error
