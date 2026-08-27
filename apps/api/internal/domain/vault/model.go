@@ -29,11 +29,32 @@ var (
 	ErrVaultClosed          = errors.New("vault is closed")
 	ErrVaultNotActive       = errors.New("vault is not active")
 	ErrInsufficientBalance  = errors.New("vault balance must be zero before closing")
+	// ErrWithdrawalExceedsPosition is returned when a withdraw would take the
+	// caller's vault position below zero. Checked before any on-chain submit
+	// (nester#1076).
+	ErrWithdrawalExceedsPosition = errors.New("withdrawal would take the position below zero")
+	// ErrTxHashRequired is returned when a withdrawal is recorded without a
+	// verified on-chain transaction hash (nester#1076).
+	ErrTxHashRequired = errors.New("transaction hash is required")
+	// ErrUnverifiedChainTx is returned when the supplied hash cannot be
+	// reconciled against a matching vault contract event.
+	ErrUnverifiedChainTx = errors.New("on-chain transaction could not be verified")
+	// ErrChainVerificationUnavailable is returned when a caller supplies a
+	// transaction hash but no chain verifier is configured. Accepting the
+	// hash unverified would let a forged one move a balance, so the request
+	// is refused rather than trusted (nester#1075, nester#1076).
+	ErrChainVerificationUnavailable = errors.New("on-chain verification is not configured; transaction hash cannot be accepted")
+	// ErrChainEventCallerMismatch is returned when a verified contract event
+	// was emitted for a different account than the caller's wallet. Without
+	// this check one user can record another user's real withdrawal against
+	// their own vault (nester#1076).
+	ErrChainEventCallerMismatch = errors.New("on-chain event belongs to a different account")
 	ErrVaultForbidden       = errors.New("vault does not belong to caller")
 	ErrAllocationNotFound   = errors.New("allocation not found")
 	ErrAllocationHasBalance = errors.New("allocation has non-zero balance; set force=true to remove")
 	ErrDuplicateProtocol    = errors.New("protocol already allocated")
 	ErrBelowMinDeposit      = errors.New("deposit amount is below the minimum required for this protocol")
+	ErrInvalidHarvestFrequency = errors.New("harvest frequency must be 'daily' or 'weekly'")
 	// ErrDuplicateTransaction is returned when a deposit/withdrawal insert
 	// collides with vault_transactions' UNIQUE transaction_hash index. A
 	// caller that generates its own idempotency-bearing hash (e.g. the
@@ -41,6 +62,13 @@ var (
 	// recorded" and safely no-op rather than fail.
 	ErrDuplicateTransaction = errors.New("transaction already recorded")
 	ErrCapacityExceeded     = errors.New("deposit would exceed vault capacity limit")
+	// ErrUserCancelled is returned when a user declines the wallet signature
+	// or abandons an attempt before submission. It exists to keep that case
+	// distinguishable from a system fault: the deposit and withdrawal SLIs
+	// (nester#1056) exclude cancellations from the denominator, and without a
+	// dedicated sentinel a cancellation would be classified as an internal
+	// failure and burn the error budget for something the system did right.
+	ErrUserCancelled = errors.New("attempt cancelled by user")
 )
 
 const (
@@ -49,6 +77,15 @@ const (
 	// DefaultCapacityWarningThreshold is the percentage of capacity at which
 	// warnings are surfaced (80% by default).
 	DefaultCapacityWarningThreshold = 80.0
+)
+
+// HarvestFrequencyDaily and HarvestFrequencyWeekly are the supported cadences
+// for the per-vault harvest engine gate (#940). Smaller vaults default to
+// daily; larger vaults may prefer weekly to reduce cumulative gas spend.
+const (
+	HarvestFrequencyDaily   = "daily"
+	HarvestFrequencyWeekly  = "weekly"
+	DefaultHarvestFrequency = HarvestFrequencyDaily
 )
 
 type Vault struct {
@@ -68,6 +105,13 @@ type Vault struct {
 	// CapacityWarningPct is the percentage threshold at which capacity warnings
 	// are surfaced. Defaults to DefaultCapacityWarningThreshold (80%) when nil.
 	CapacityWarningPct  *float64         `json:"capacity_warning_pct,omitempty"`
+	// HarvestFrequency controls how often the harvest engine will consider this
+	// vault for a harvest: "daily" or "weekly". Defaults to
+	// DefaultHarvestFrequency when empty.
+	HarvestFrequency    string           `json:"harvest_frequency"`
+	// LastHarvestedAt is when the vault's yield was last harvested, used by the
+	// harvest engine to enforce HarvestFrequency. Nil means never harvested.
+	LastHarvestedAt     *time.Time       `json:"last_harvested_at,omitempty"`
 	LastSyncedAt        *time.Time       `json:"last_synced_at,omitempty"`
 	LastAPYAlertSentAt  *time.Time       `json:"last_apy_alert_sent_at,omitempty"`
 	DeletedAt           *time.Time       `json:"deleted_at,omitempty"`
@@ -144,6 +188,7 @@ type Repository interface {
 	UpdateVaultBalances(ctx context.Context, id uuid.UUID, totalDeposited decimal.Decimal, currentBalance decimal.Decimal) error
 	ReplaceAllocations(ctx context.Context, vaultID uuid.UUID, allocations []Allocation) error
 	UpdateVault(ctx context.Context, id uuid.UUID, contractAddress string, status VaultStatus) error
+	UpdateHarvestFrequency(ctx context.Context, id uuid.UUID, frequency string) error
 	RecordWithdrawal(ctx context.Context, vaultID uuid.UUID, record TransactionRecord) error
 	RecordHarvest(ctx context.Context, input HarvestRecordInput) error
 	RecordRebalance(ctx context.Context, input RebalanceRecordInput, withdrawRecord, depositRecord TransactionRecord) error
@@ -166,6 +211,20 @@ func (s VaultStatus) CanTransitionTo(next VaultStatus) bool {
 		return next == StatusActive || next == StatusClosed
 	default:
 		return false
+	}
+}
+
+// ParseHarvestFrequency validates a harvest frequency string, returning
+// ErrInvalidHarvestFrequency for anything other than "daily" or "weekly"
+// (case-insensitive, trimmed).
+func ParseHarvestFrequency(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case HarvestFrequencyDaily:
+		return HarvestFrequencyDaily, nil
+	case HarvestFrequencyWeekly:
+		return HarvestFrequencyWeekly, nil
+	default:
+		return "", ErrInvalidHarvestFrequency
 	}
 }
 

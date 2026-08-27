@@ -285,6 +285,17 @@ func (r *handlerRepository) UpdateVault(_ context.Context, id uuid.UUID, contrac
 	return nil
 }
 
+func (r *handlerRepository) UpdateHarvestFrequency(_ context.Context, id uuid.UUID, frequency string) error {
+	model, ok := r.vaults[id]
+	if !ok {
+		return vault.ErrVaultNotFound
+	}
+	model.HarvestFrequency = frequency
+	model.UpdatedAt = time.Now().UTC()
+	r.vaults[id] = cloneHandlerVault(model)
+	return nil
+}
+
 func (r *handlerRepository) RecordHarvest(_ context.Context, input vault.HarvestRecordInput) error {
 	model, ok := r.vaults[input.VaultID]
 	if !ok {
@@ -320,6 +331,13 @@ func (r *handlerRepository) RecordWithdrawal(_ context.Context, id uuid.UUID, re
 	}
 	if record.Amount.Cmp(decimal.Zero) <= 0 {
 		return vault.ErrInvalidAmount
+	}
+	if record.TransactionHash != "" {
+		for _, txn := range r.transactions {
+			if txn.TransactionHash == record.TransactionHash {
+				return vault.ErrDuplicateTransaction
+			}
+		}
 	}
 
 	model.CurrentBalance = model.CurrentBalance.Sub(record.Amount)

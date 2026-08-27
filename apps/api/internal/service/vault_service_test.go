@@ -64,6 +64,40 @@ func TestVaultServiceRecordDepositAndUpdateAllocations(t *testing.T) {
 	}
 }
 
+func TestVaultServiceUpdateHarvestFrequency(t *testing.T) {
+	userID := uuid.New()
+	repository := newMemoryVaultRepository(userID)
+	service := NewVaultService(repository)
+
+	created, err := service.CreateVault(context.Background(), CreateVaultInput{
+		UserID:          userID,
+		ContractAddress: "CA123",
+		Currency:        "usdc",
+	})
+	if err != nil {
+		t.Fatalf("CreateVault() error = %v", err)
+	}
+	if created.HarvestFrequency != vault.HarvestFrequencyDaily {
+		t.Fatalf("new vault harvest frequency = %q, want default %q", created.HarvestFrequency, vault.HarvestFrequencyDaily)
+	}
+
+	updated, err := service.UpdateHarvestFrequency(context.Background(), created.ID, userID, "weekly")
+	if err != nil {
+		t.Fatalf("UpdateHarvestFrequency() error = %v", err)
+	}
+	if updated.HarvestFrequency != vault.HarvestFrequencyWeekly {
+		t.Fatalf("harvest frequency = %q, want %q", updated.HarvestFrequency, vault.HarvestFrequencyWeekly)
+	}
+
+	if _, err := service.UpdateHarvestFrequency(context.Background(), created.ID, userID, "monthly"); err != vault.ErrInvalidHarvestFrequency {
+		t.Fatalf("invalid frequency err = %v, want ErrInvalidHarvestFrequency", err)
+	}
+
+	if _, err := service.UpdateHarvestFrequency(context.Background(), created.ID, uuid.New(), "weekly"); err != vault.ErrVaultForbidden {
+		t.Fatalf("non-owner err = %v, want ErrVaultForbidden", err)
+	}
+}
+
 func TestVaultServiceCreateVaultReturnsUserNotFound(t *testing.T) {
 	service := NewVaultService(newMemoryVaultRepository())
 
@@ -246,6 +280,9 @@ func (r *memoryVaultRepository) CreateVault(_ context.Context, model vault.Vault
 		return vault.Vault{}, vault.ErrUserNotFound
 	}
 
+	if model.HarvestFrequency == "" {
+		model.HarvestFrequency = vault.DefaultHarvestFrequency
+	}
 	now := time.Now().UTC()
 	model.CreatedAt = now
 	model.UpdatedAt = now
@@ -360,6 +397,17 @@ func (r *memoryVaultRepository) UpdateVault(_ context.Context, id uuid.UUID, con
 	return nil
 }
 
+func (r *memoryVaultRepository) UpdateHarvestFrequency(_ context.Context, id uuid.UUID, frequency string) error {
+	model, ok := r.vaults[id]
+	if !ok {
+		return vault.ErrVaultNotFound
+	}
+	model.HarvestFrequency = frequency
+	model.UpdatedAt = time.Now().UTC()
+	r.vaults[id] = cloneVault(model)
+	return nil
+}
+
 func (r *memoryVaultRepository) RecordHarvest(_ context.Context, input vault.HarvestRecordInput) error {
 	model, ok := r.vaults[input.VaultID]
 	if !ok {
@@ -391,6 +439,13 @@ func (r *memoryVaultRepository) RecordWithdrawal(_ context.Context, id uuid.UUID
 	}
 	if record.Amount.Cmp(decimal.Zero) <= 0 {
 		return vault.ErrInvalidAmount
+	}
+	if record.TransactionHash != "" {
+		for _, txn := range r.transactions {
+			if txn.TransactionHash == record.TransactionHash {
+				return vault.ErrDuplicateTransaction
+			}
+		}
 	}
 
 	model.CurrentBalance = model.CurrentBalance.Sub(record.Amount)

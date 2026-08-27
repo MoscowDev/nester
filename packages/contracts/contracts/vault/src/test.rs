@@ -278,6 +278,51 @@ fn first_deposit_creates_one_to_one_shares() {
 }
 
 #[test]
+fn direct_donation_cannot_create_first_depositor_profit() {
+    let (env, admin, token, vault, _treasury) = setup();
+    let attacker = Address::generate(&env);
+    let victim = Address::generate(&env);
+    let seed = nester_common::MIN_DEPOSIT_AMOUNT;
+    let donation = 1_000 * XLM;
+    let victim_deposit = 100 * XLM;
+    let token_client = token::Client::new(&env, &token.address);
+
+    // Disable exit fees so the balance comparison isolates donation economics.
+    let mut fee_config = vault.get_fee_config();
+    fee_config.early_withdrawal_fee_bps = 0;
+    vault.set_fee_config(&admin, &fee_config);
+
+    mint(&token, &attacker, seed + donation);
+    mint(&token, &victim, victim_deposit);
+
+    // Reproduce the classic first-depositor sequence: seed at the minimum,
+    // then donate directly to the vault without calling any vault entrypoint.
+    let attacker_shares = vault.deposit(&attacker, &seed, &0);
+    token_client.transfer(&attacker, &vault.address, &donation);
+
+    assert_eq!(token_client.balance(&vault.address), seed + donation);
+    assert_eq!(
+        vault.total_assets(),
+        seed,
+        "raw token donations must not inflate the accounted share price"
+    );
+    assert_eq!(vault.preview_withdraw(&attacker_shares), seed);
+
+    // Outcome: the victim still enters at the unaffected 1:1 exchange rate,
+    // and the attacker cannot redeem either the donation or the victim's funds.
+    let victim_shares = vault.deposit(&victim, &victim_deposit, &0);
+    assert_eq!(victim_shares, victim_deposit);
+    assert_eq!(vault.preview_withdraw(&attacker_shares), seed);
+
+    vault.withdraw(&attacker, &attacker_shares, &0);
+    assert_eq!(
+        token_client.balance(&attacker),
+        seed,
+        "the attack must lose the donation rather than profit from the victim"
+    );
+}
+
+#[test]
 fn subsequent_deposit_uses_current_share_price() {
     let (_env, _admin, token, vault, _treasury) = setup();
 
@@ -1370,10 +1415,11 @@ fn test_harvest_basic() {
     assert!(result.compounded);
     assert_eq!(result.user, user);
 
-    // new_share_balance must be >= shares before harvest (net yield minted new shares)
+    // Yield was already reflected in the existing shares. Harvest charges the
+    // fee by burning only the harvesting user's fee-equivalent shares.
     assert!(
-        result.new_share_balance >= shares_before,
-        "share balance should have grown after compounding"
+        result.new_share_balance < shares_before,
+        "only fee-equivalent shares should be burned from the harvesting user"
     );
 
     // Performance fee must have been sent to treasury (not sitting in accrued fees)
@@ -1604,8 +1650,7 @@ fn test_harvest_impairment_no_fee_charged() {
 }
 
 #[test]
-fn test_harvest_new_share_balance_increases() {
-    // After harvest, user's share balance should be greater than before
+fn harvest_fee_burns_only_the_harvesting_users_shares() {
     let (env, admin, token, vault, _treasury) = setup();
     let user = Address::generate(&env);
     let deposit = 1_000 * XLM;
@@ -1617,18 +1662,57 @@ fn test_harvest_new_share_balance_increases() {
     vault.grant_role(&admin, &admin, &Role::Manager);
     vault.report_yield(&admin, &(500 * XLM));
 
-    let shares_before = vault.get_shares(&admin);
-    let result = vault.harvest(&admin);
+    let shares_before = vault.get_shares(&user);
+    let result = vault.harvest(&user);
 
     assert!(
-        result.new_share_balance >= shares_before,
-        "share balance must not decrease after harvest with positive yield"
+        result.new_share_balance < shares_before,
+        "the performance fee must be charged in the harvesting user's shares"
     );
     assert_eq!(
         result.new_share_balance,
-        vault.get_shares(&admin),
+        vault.get_shares(&user),
         "new_share_balance in result must match on-chain balance"
     );
+}
+
+#[test]
+fn performance_fee_does_not_dilute_passive_holders() {
+    let (env, admin, token, vault, treasury) = setup();
+    let harvester = Address::generate(&env);
+    let passive_holder = Address::generate(&env);
+    let deposit = 1_000 * XLM;
+    let yield_amount = 200 * XLM;
+
+    mint(&token, &harvester, deposit);
+    mint(&token, &passive_holder, deposit);
+    vault.deposit(&harvester, &deposit, &0);
+    vault.deposit(&passive_holder, &deposit, &0);
+
+    vault.grant_role(&admin, &admin, &Role::Manager);
+    mint(&token, &vault.address, yield_amount);
+    vault.report_yield(&admin, &yield_amount);
+
+    let passive_value_before = vault.get_balance(&passive_holder);
+    let share_price_before = vault.share_price();
+    let treasury_before = token::Client::new(&env, &token.address).balance(&treasury);
+
+    let result = vault.harvest(&harvester);
+
+    let share_price_after = vault.share_price();
+    let passive_value_after = vault.get_balance(&passive_holder);
+    let treasury_after = token::Client::new(&env, &token.address).balance(&treasury);
+
+    assert!(result.performance_fee > 0, "the regression must exercise a fee");
+    assert!(
+        share_price_after >= share_price_before,
+        "one user's performance fee must not lower the exchange rate"
+    );
+    assert!(
+        passive_value_after >= passive_value_before,
+        "a passive holder must not lose value when another user harvests"
+    );
+    assert_eq!(treasury_after - treasury_before, result.performance_fee);
 }
 
 #[test]
@@ -2410,3 +2494,253 @@ fn measure_reentrancy_guard_resource_cost_on_deposit_and_withdraw() {
          reentrancy_guard_withdraw_cpu={withdraw_cpu} reentrancy_guard_withdraw_mem={withdraw_mem}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Property-based invariant test suite (proptest)
+// ---------------------------------------------------------------------------
+mod proptests {
+    use super::*;
+    use crate::conversion;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Property 1a: Pure conversion round-trip invariant
+        /// `shares_to_assets_down(assets_to_shares_down(a, TA, TS), TA + a, TS + shares) <= a`
+        /// Converted assets never exceed original assets for any initial assets and shares.
+        #[test]
+        fn prop_pure_conversion_roundtrip(
+            initial_assets in 1_i128..1_000_000_000 * XLM,
+            initial_shares in 1_i128..1_000_000_000 * XLM,
+            deposit_amount in nester_common::MIN_DEPOSIT_AMOUNT..100_000_000 * XLM,
+        ) {
+            let shares_minted = conversion::assets_to_shares_down(
+                deposit_amount,
+                initial_assets,
+                initial_shares,
+            ).unwrap();
+
+            let assets_back = conversion::shares_to_assets_down(
+                shares_minted,
+                initial_assets + deposit_amount,
+                initial_shares + shares_minted,
+            ).unwrap();
+
+            prop_assert!(
+                assets_back <= deposit_amount,
+                "Round-trip assets returned ({assets_back}) must not exceed deposited ({deposit_amount})"
+            );
+        }
+
+        /// Property 1b: Full contract deposit-then-withdraw round-trip invariant
+        /// `withdraw(shares(deposit(a))) <= a`
+        /// Withdrawing immediately minted shares never returns more than the deposited amount.
+        #[test]
+        fn prop_contract_deposit_withdraw_roundtrip(
+            deposit_amount in nester_common::MIN_DEPOSIT_AMOUNT..1_000_000 * XLM,
+        ) {
+            let (env, admin, token, vault, _treasury) = setup();
+            let user = Address::generate(&env);
+            mint(&token, &user, deposit_amount);
+
+            // Disable early-withdrawal fee to isolate rounding math
+            let mut fee_config = vault.get_fee_config();
+            fee_config.early_withdrawal_fee_bps = 0;
+            vault.set_fee_config(&admin, &fee_config);
+
+            let initial_user_token_bal = token::Client::new(&env, &token.address).balance(&user);
+
+            let shares_minted = vault.deposit(&user, &deposit_amount, &0);
+            vault.withdraw(&user, &shares_minted, &0);
+
+            let final_user_token_bal = token::Client::new(&env, &token.address).balance(&user);
+            prop_assert!(
+                final_user_token_bal <= initial_user_token_bal,
+                "User balance after deposit & withdraw ({final_user_token_bal}) must be <= initial ({initial_user_token_bal})"
+            );
+        }
+
+        /// Property 2: Economic Invariant — No value creation across multi-user sequences
+        /// Across randomized deposit and withdrawal sequences with optional yield,
+        /// cumulative assets returned to users never exceeds total deposited + positive yield.
+        #[test]
+        fn prop_no_value_creation_multi_user(
+            dep1 in nester_common::MIN_DEPOSIT_AMOUNT..500_000 * XLM,
+            dep2 in nester_common::MIN_DEPOSIT_AMOUNT..500_000 * XLM,
+            yield_amount in 0_i128..100_000 * XLM,
+            withdraw_pct_1 in 1_u32..100_u32,
+            withdraw_pct_2 in 1_u32..100_u32,
+        ) {
+            let (env, admin, token, vault, _treasury) = setup();
+            let alice = Address::generate(&env);
+            let bob = Address::generate(&env);
+
+            mint(&token, &alice, dep1);
+            mint(&token, &bob, dep2);
+
+            // User 1 deposits
+            let alice_shares = vault.deposit(&alice, &dep1, &0);
+
+            // Report yield if any
+            if yield_amount > 0 {
+                vault.grant_role(&admin, &admin, &Role::Manager);
+                vault.report_yield(&admin, &yield_amount);
+                mint(&token, &vault.address, yield_amount);
+            }
+
+            // User 2 deposits
+            let bob_shares = vault.deposit(&bob, &dep2, &0);
+
+            // Partial or full withdrawals
+            let alice_withdraw_shares = alice_shares * (withdraw_pct_1 as i128) / 100;
+            let bob_withdraw_shares = bob_shares * (withdraw_pct_2 as i128) / 100;
+
+            if alice_withdraw_shares > 0 {
+                vault.withdraw(&alice, &alice_withdraw_shares, &0);
+            }
+            if bob_withdraw_shares > 0 {
+                vault.withdraw(&bob, &bob_withdraw_shares, &0);
+            }
+
+            let alice_bal = token::Client::new(&env, &token.address).balance(&alice);
+            let bob_bal = token::Client::new(&env, &token.address).balance(&bob);
+
+            let total_received = alice_bal + bob_bal;
+            let max_possible = dep1 + dep2 + yield_amount;
+
+            prop_assert!(
+                total_received <= max_possible,
+                "Total assets withdrawn ({total_received}) exceeds total deposited + yield ({max_possible})"
+            );
+        }
+
+        /// Property 3: Share Price Monotonicity under positive yield & exact halving under 50% impairment
+        #[test]
+        fn prop_share_price_monotonicity_and_impairment(
+            initial_deposit in nester_common::MIN_DEPOSIT_AMOUNT..1_000_000 * XLM,
+            yield_pct in 1_i128..100_i128,
+        ) {
+            let (env, admin, token, vault, _treasury) = setup();
+            let user = Address::generate(&env);
+            mint(&token, &user, initial_deposit);
+            vault.deposit(&user, &initial_deposit, &0);
+
+            let price_before = vault.share_price();
+
+            // Positive yield increases share price
+            let yield_val = initial_deposit * yield_pct / 100;
+            vault.grant_role(&admin, &admin, &Role::Manager);
+            vault.report_yield(&admin, &yield_val);
+
+            let price_after_yield = vault.share_price();
+            prop_assert!(
+                price_after_yield > price_before,
+                "Share price after positive yield ({price_after_yield}) must be > before ({price_before})"
+            );
+
+            // Impairment: loss equal to 50% of current total assets halves share price
+            let current_total_assets = vault.get_total_deposits();
+            let loss = current_total_assets / 2;
+            vault.report_yield(&admin, &(-loss));
+
+            let price_after_impairment = vault.share_price();
+            // Expected price after 50% loss: half of price_after_yield
+            let expected_halved_price = price_after_yield / 2;
+
+            prop_assert!(
+                (price_after_impairment - expected_halved_price).abs() <= 1,
+                "Share price after 50% impairment ({price_after_impairment}) must equal half of post-yield price ({expected_halved_price}) within rounding tolerance",
+                price_after_impairment = price_after_impairment,
+                expected_halved_price = expected_halved_price
+            );
+
+            // Impaired withdrawal charges zero performance fee
+            let shares = vault.get_shares(&user);
+            let fee_preview = vault.withdrawal_fee_preview(&user, &shares);
+            prop_assert_eq!(
+                fee_preview.performance_fee_deducted,
+                0,
+                "Impaired position must be charged 0 performance fee"
+            );
+        }
+
+        /// Property 4: Inflation attack resistance / First-depositor protection
+        ///
+        /// ERC-4626 Inflation Attack Scenario:
+        /// 1. Attacker deposits a tiny amount (MIN_DEPOSIT_AMOUNT = 10_000_000).
+        /// 2. Attacker inflates vault assets via yield report / direct transfer.
+        /// 3. Victim attempts to deposit `b`.
+        ///
+        /// Mitigation Verification:
+        /// - If victim specifies `min_shares_out > 0` and the ratio would round victim's shares to 0,
+        ///   `deposit` panics with `SlippageExceeded` (protecting victim funds from being stolen).
+        /// - If victim deposits enough assets to receive shares (> 0), victim receives their exact
+        ///   proportional value upon withdrawal, preventing value theft by the first depositor.
+        #[test]
+        fn prop_first_depositor_inflation_attack_resistance(
+            attacker_deposit in nester_common::MIN_DEPOSIT_AMOUNT..(nester_common::MIN_DEPOSIT_AMOUNT * 2),
+            direct_transfer in 1_000 * XLM..100_000 * XLM,
+            victim_deposit in nester_common::MIN_DEPOSIT_AMOUNT..50_000 * XLM,
+        ) {
+            let (env, admin, token, vault, _treasury) = setup();
+            let attacker = Address::generate(&env);
+            let victim = Address::generate(&env);
+
+            mint(&token, &attacker, attacker_deposit + direct_transfer);
+            mint(&token, &victim, victim_deposit);
+
+            // 1. Attacker makes initial small deposit
+            let attacker_shares = vault.deposit(&attacker, &attacker_deposit, &0);
+            prop_assert!(attacker_shares > 0);
+
+            // 2. Attacker inflates vault assets via yield report / direct transfer
+            vault.grant_role(&admin, &admin, &Role::Manager);
+            vault.report_yield(&admin, &direct_transfer);
+            mint(&token, &vault.address, direct_transfer);
+
+            // 3. Check victim deposit behavior
+            let total_assets = vault.get_total_deposits();
+            let total_shares = vault.get_shares(&attacker);
+
+            // Pure math preview of expected shares for victim
+            let expected_victim_shares = conversion::assets_to_shares_down(
+                victim_deposit,
+                total_assets,
+                total_shares,
+            ).unwrap();
+
+            if expected_victim_shares == 0 {
+                // If victim's deposit is diluted to 0 shares by the inflation,
+                // passing min_shares_out = 1 must revert with SlippageExceeded, protecting victim.
+                let try_res = vault.try_deposit(&victim, &victim_deposit, &1);
+                prop_assert!(
+                    try_res.is_err(),
+                    "Deposit rounding to 0 shares must be rejected when min_shares_out > 0"
+                );
+            } else {
+                // If victim receives shares (>0), victim must be able to redeem assets proportionally
+                let victim_shares = vault.deposit(&victim, &victim_deposit, &0);
+                prop_assert_eq!(victim_shares, expected_victim_shares);
+
+                // Gross redeemable assets (preview_withdraw returns gross share value)
+                let victim_gross_redeemable = vault.preview_withdraw(&victim_shares);
+                let total_assets_now = total_assets + victim_deposit;
+                let total_shares_now = total_shares + victim_shares;
+                let expected_redeemable = conversion::shares_to_assets_down(
+                    victim_shares,
+                    total_assets_now,
+                    total_shares_now,
+                ).unwrap();
+
+                prop_assert!(
+                    victim_gross_redeemable == expected_redeemable,
+                    "Victim gross redeemable assets ({victim_gross_redeemable}) must equal expected share of vault ({expected_redeemable})",
+                    victim_gross_redeemable = victim_gross_redeemable,
+                    expected_redeemable = expected_redeemable
+                );
+            }
+        }
+    }
+}
+
