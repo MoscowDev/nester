@@ -40,6 +40,8 @@ export interface SavingsGoal {
   /** Sharing. */
   share_token?: string;
   is_shared?: boolean;
+  /** Persisted session summary / coaching notes (#929). */
+  notes?: string;
 }
 
 export interface SharedGoalView {

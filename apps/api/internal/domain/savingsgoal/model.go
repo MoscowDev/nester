@@ -227,8 +227,10 @@ type SavingsGoal struct {
 	IsShared        bool       `json:"is_shared"`
 	// On-chain linkage (#807). OnchainGoalID is nil until asynchronous
 	// registration against the savings_goal contract succeeds.
-	OnchainGoalID  *string `json:"onchain_goal_id,omitempty"`
-	OnchainStatus  *string `json:"onchain_status,omitempty"`
+	OnchainGoalID *string `json:"onchain_goal_id,omitempty"`
+	OnchainStatus *string `json:"onchain_status,omitempty"`
+	// Notes persists session summaries / coaching notes back to the savings goal (#929).
+	Notes string `json:"notes,omitempty"`
 }
 
 // SharedGoalView is the read-only public projection of a savings goal exposed
@@ -295,6 +297,8 @@ type Repository interface {
 	// UpdateOnchainLink persists the result of asynchronously registering the
 	// goal against the savings_goal contract (#807).
 	UpdateOnchainLink(ctx context.Context, goalID uuid.UUID, onchainGoalID, onchainStatus string) error
+	// UpdateNotes updates the notes column on a savings goal (#929).
+	UpdateNotes(ctx context.Context, goalID uuid.UUID, notes string) error
 }
 
 // categoryIconDefaults maps each GoalCategory to a default icon name and color
