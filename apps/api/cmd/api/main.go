@@ -36,6 +36,7 @@ import (
 	"github.com/suncrestlabs/nester/apps/api/internal/metrics"
 	"github.com/suncrestlabs/nester/apps/api/internal/middleware"
 	"github.com/suncrestlabs/nester/apps/api/internal/notifications"
+	"github.com/suncrestlabs/nester/apps/api/internal/objectstorage"
 	"github.com/suncrestlabs/nester/apps/api/internal/oracle"
 	"github.com/suncrestlabs/nester/apps/api/internal/repository"
 	"github.com/suncrestlabs/nester/apps/api/internal/repository/postgres"
@@ -304,6 +305,25 @@ func run() error {
 	userHandler := handler.NewUserHandler(userService)
 	userVaultsSvc := service.NewUserVaultsService(vaultRepository)
 	userHandler.SetUserVaultsService(userVaultsSvc)
+
+	// KYC document storage (nester#1191). KYC_STORAGE_DIR defaults to a local
+	// directory rather than requiring a cloud object-storage decision to be
+	// made before the endpoint can accept uploads at all — see
+	// internal/objectstorage's package doc for why this is a real store, not
+	// a placeholder, and what a production cloud store would replace it
+	// with. Left unset (nil) only if the directory genuinely cannot be
+	// created, in which case submitKYC rejects uploads (503) rather than
+	// silently discarding them.
+	kycStorageDir := os.Getenv("KYC_STORAGE_DIR")
+	if kycStorageDir == "" {
+		kycStorageDir = "./data/kyc-documents"
+	}
+	kycStore, kycStoreErr := objectstorage.NewLocalDiskStore(kycStorageDir, handler.MaxKYCDocumentBytes, handler.KYCAllowedContentTypes)
+	if kycStoreErr != nil {
+		slog.Warn("KYC document storage unavailable — submitKYC will reject uploads until this is fixed", "error", kycStoreErr, "dir", kycStorageDir)
+	} else {
+		userHandler.SetKYCStore(kycStore)
+	}
 	notificationRepository := postgres.NewNotificationRepository(db)
 	notificationHandler := handler.NewNotificationHandler(notificationRepository)
 
