@@ -91,7 +91,9 @@ func (s *LocalDiskStore) Put(_ context.Context, keyPrefix string, contentType st
 	}
 
 	destPath := filepath.Join(s.BaseDir, key)
-	if err := os.MkdirAll(filepath.Dir(destPath), 0o750); err != nil {
+	// 0o700 for the same reason as the file mode below — no other account
+	// needs to traverse the KYC document tree.
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o700); err != nil {
 		return "", fmt.Errorf("objectstorage: create key dir: %w", err)
 	}
 
@@ -99,7 +101,11 @@ func (s *LocalDiskStore) Put(_ context.Context, keyPrefix string, contentType st
 	// output (a fresh UUID-shaped random hex string) and keyPrefix, which
 	// callers pass as a trusted internal value (a user id), never from
 	// unsanitized client input — see generateKey's own doc comment.
-	f, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
+	// 0o600, not 0o640: these are KYC identity documents, and nothing but
+	// this process needs to read them. A group-readable mode widens access
+	// to every account in the service's group for no benefit, which is what
+	// gosec's G302 flags here.
+	f, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("objectstorage: open destination: %w", err)
 	}

@@ -15,7 +15,6 @@ pub enum AggregatorError {
     MaxHopsExceeded = 3,
     EmptyPath = 4,
     InvalidMaxHops = 5,
-    ReservesUnavailable = 6,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
