@@ -447,6 +447,11 @@ func (r *memoryVaultRepository) RecordWithdrawal(_ context.Context, id uuid.UUID
 			}
 		}
 	}
+	// Mirrors the Postgres repository: the sufficiency check re-runs under
+	// the row lock at write time (nester#1084).
+	if model.CurrentBalance.LessThan(record.Amount) {
+		return vault.ErrWithdrawalExceedsPosition
+	}
 
 	model.CurrentBalance = model.CurrentBalance.Sub(record.Amount)
 	model.UpdatedAt = time.Now().UTC()

@@ -691,6 +691,12 @@ func (s *VaultService) RecordWithdrawal(ctx context.Context, input RecordWithdra
 	// made the guard opt-out: any request carrying tx_hash bypassed it, and
 	// when no verifier is configured nothing re-checks afterwards, so a
 	// forged hash drove current_balance negative.
+	//
+	// This read is NOT serialised against concurrent withdrawals — it is a
+	// fast-fail so we never submit a doomed on-chain call. The authoritative
+	// check re-runs inside repository.RecordWithdrawal under a row lock
+	// (SELECT ... FOR UPDATE), which is what makes concurrent withdrawals of
+	// the same position safe (nester#1084).
 	if existing.CurrentBalance.LessThan(input.Amount) {
 		return vault.Vault{}, vault.ErrWithdrawalExceedsPosition
 	}

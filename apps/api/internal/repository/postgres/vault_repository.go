@@ -439,6 +439,22 @@ func (r *VaultRepository) UpdateHarvestFrequency(ctx context.Context, id uuid.UU
 
 // RecordWithdrawal decrements current_balance atomically and writes a ledger
 // entry. It does NOT touch total_deposited (deposits are never reversed).
+//
+// Serialisation (nester#1084): the position row is locked with
+// SELECT ... FOR UPDATE and the sufficient-funds check re-runs under that
+// lock. Two concurrent withdrawals therefore cannot both read the same
+// pre-withdrawal balance and both pass — the second waits on the row lock and
+// re-checks against the post-withdrawal balance. The service-layer check
+// stays as a fast-fail before any on-chain submit; this one is authoritative.
+//
+// Lock ordering (deadlock safety): every money-path write — RecordDeposit,
+// RecordWithdrawal, RecordHarvest, applyConfirmedBalanceChange — locks
+// exactly one vaults row first (the deposit path's single atomic UPDATE takes
+// the same row lock, an equivalent serialisation) and only then inserts into
+// vault_transactions. No money path locks a second vaults row or takes the
+// two in the other order, so deposit and withdrawal cannot deadlock; they
+// queue on the same row lock. The lock spans only the statements below — no
+// network or chain I/O happens inside the transaction.
 func (r *VaultRepository) RecordWithdrawal(ctx context.Context, id uuid.UUID, record vault.TransactionRecord) error {
 	if record.Amount.Cmp(decimal.Zero) <= 0 {
 		return vault.ErrInvalidAmount
@@ -450,7 +466,27 @@ func (r *VaultRepository) RecordWithdrawal(ctx context.Context, id uuid.UUID, re
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	result, err := tx.ExecContext(
+	var rawBalance string
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT current_balance FROM vaults WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`,
+		id.String(),
+	).Scan(&rawBalance); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return vault.ErrVaultNotFound
+		}
+		return mapRepositoryError(err)
+	}
+
+	balance, err := decimal.NewFromString(rawBalance)
+	if err != nil {
+		return fmt.Errorf("parse current balance: %w", err)
+	}
+	if balance.LessThan(record.Amount) {
+		return vault.ErrWithdrawalExceedsPosition
+	}
+
+	if _, err := tx.ExecContext(
 		ctx,
 		`UPDATE vaults
 		 SET current_balance = current_balance - $2::numeric,
@@ -458,17 +494,8 @@ func (r *VaultRepository) RecordWithdrawal(ctx context.Context, id uuid.UUID, re
 		 WHERE id = $1 AND deleted_at IS NULL`,
 		id.String(),
 		record.Amount.String(),
-	)
-	if err != nil {
+	); err != nil {
 		return mapRepositoryError(err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rowsAffected == 0 {
-		return vault.ErrVaultNotFound
 	}
 
 	if _, err := tx.ExecContext(
