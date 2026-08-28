@@ -343,6 +343,21 @@ func (c *ContractInvoker) rpcCall(ctx context.Context, method string, params, re
 
 	span.SetAttributes(semconv.HTTPResponseStatusCode(resp.StatusCode))
 
+	// A non-2xx response is an outage, not a result (#1090). Decoding it anyway
+	// is how a 500 carrying a JSON-RPC-shaped body becomes a *successful* call
+	// that returns a zero value: sendTransaction reports no error and an empty
+	// transaction hash, so a submission is recorded that the chain never saw
+	// and reconciliation has no hash to look up; simulateTransaction reports an
+	// empty simulation, so a write is signed and submitted unsimulated.
+	//
+	// The body is deliberately not included in the error, for the same reason
+	// nothing else in this function records it: it carries transaction XDR.
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		wrapped := fmt.Errorf("rpc %s: unexpected status %d", method, resp.StatusCode)
+		telemetry.RecordError(span, wrapped)
+		return wrapped
+	}
+
 	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
 		telemetry.RecordError(span, err)
 		return err
