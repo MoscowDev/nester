@@ -515,9 +515,16 @@ tests:
     input_series:
       - series: 'nester_indexer_lag_ledgers'
         values: '2x30'
+      - series: 'nester_indexer_lag_seconds'
+        values: '16x30'
+      - series: 'nester_indexer_staleness_budget_seconds'
+        values: '300x30'
       - series: 'nester_indexer_lag_last_sample_age_seconds'
         values: '0x30'
     alert_rule_test:
+      - eval_time: 20m
+        alertname: IndexerStalenessBudgetExceeded
+        exp_alerts: []
       - eval_time: 20m
         alertname: IndexerLagHigh
         exp_alerts: []
@@ -600,6 +607,106 @@ tests:
             exp_annotations:
               summary: "Event indexer has not reported lag for 20m 0s"
               description: "The lag gauge has not been updated in over 5 minutes, so the freshness signal itself is stale. The indexer polls every 6s, so this means it is wedged, erroring, or dead. Critically, the lag gauge may still read healthy — do not trust it. Check nester_indexer_lag_sample_errors_total and the indexer logs."
+              dashboard: /d/nester-slo-balance/balance-freshness
+              runbook: docs/observability/runbooks/balance-freshness.md
+
+  # ---------------------------------------------------------------------------
+  # The staleness budget (nester#1088)
+  # ---------------------------------------------------------------------------
+  #
+  # The budget is not a literal in the rule — it is a series the application
+  # exports — so these cases also prove the comparison reads it rather than a
+  # hardcoded 300.
+  #
+  # Boundary: the expression uses `>`, so lag exactly at the budget is inside
+  # it and must not fire. This is the same rule the API's stale flag applies.
+  - interval: 1m
+    name: staleness exactly at the budget does not page
+    input_series:
+      - series: 'nester_indexer_lag_seconds'
+        values: '300x30'
+      - series: 'nester_indexer_staleness_budget_seconds'
+        values: '300x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: IndexerStalenessBudgetExceeded
+        exp_alerts: []
+
+  - interval: 1m
+    name: staleness past the budget pages after the confirmation window
+    input_series:
+      # Flat rather than a ramp, so the asserted annotation does not depend on
+      # which sample promtool considers current at eval time.
+      - series: 'nester_indexer_lag_seconds'
+        values: '900x30'
+      - series: 'nester_indexer_staleness_budget_seconds'
+        values: '300x30'
+    alert_rule_test:
+      # Over the budget from t=0, held pending by `for: 2m`.
+      - eval_time: 1m
+        alertname: IndexerStalenessBudgetExceeded
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: IndexerStalenessBudgetExceeded
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: balance_freshness
+              service: api
+            exp_annotations:
+              summary: "Indexed balances are 15m 0s out of date, past the staleness budget"
+              description: "The indexed view of the chain is 15m 0s old against a staleness budget of 5m 0s. The API is now returning X-Indexer-Stale: true on every /api/ response, so clients are being told their balances are out of date. This fires whether the indexer is merely behind or has stopped completely: nester_indexer_lag_seconds is derived from the clock at scrape time, so it keeps climbing with nothing running to push it. Check nester_indexer_lag_last_sample_age_seconds first — near zero means running but behind, climbing means stopped."
+              dashboard: /d/nester-slo-balance/balance-freshness
+              runbook: docs/observability/runbooks/balance-freshness.md
+
+  # A retuned budget moves the alert with it. Same lag as the case above, but a
+  # 30 minute budget: nothing may fire. This is what proves the threshold comes
+  # from the application rather than from a number in this repository.
+  - interval: 1m
+    name: a widened budget silences the same staleness
+    input_series:
+      - series: 'nester_indexer_lag_seconds'
+        values: '900x30'
+      - series: 'nester_indexer_staleness_budget_seconds'
+        values: '1800x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: IndexerStalenessBudgetExceeded
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # A completely dead indexer. The case this issue exists for.
+  # ---------------------------------------------------------------------------
+  #
+  # The indexer stopped, so it never published another position and
+  # nester_indexer_lag_ledgers is absent entirely — IndexerLagHigh has nothing
+  # to fire on and correctly does not. The seconds view is still present and
+  # still climbing, because the process derives it from the clock at scrape
+  # time, and it is what pages.
+  - interval: 1m
+    name: a dead indexer pages on staleness even with no ledger lag series
+    input_series:
+      # Deliberately no nester_indexer_lag_ledgers series at all.
+      - series: 'nester_indexer_lag_seconds'
+        values: '1200x30'
+      - series: 'nester_indexer_staleness_budget_seconds'
+        values: '300x30'
+      - series: 'nester_indexer_lag_last_sample_age_seconds'
+        values: '1200x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: IndexerLagHigh
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: IndexerStalenessBudgetExceeded
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: balance_freshness
+              service: api
+            exp_annotations:
+              summary: "Indexed balances are 20m 0s out of date, past the staleness budget"
+              description: "The indexed view of the chain is 20m 0s old against a staleness budget of 5m 0s. The API is now returning X-Indexer-Stale: true on every /api/ response, so clients are being told their balances are out of date. This fires whether the indexer is merely behind or has stopped completely: nester_indexer_lag_seconds is derived from the clock at scrape time, so it keeps climbing with nothing running to push it. Check nester_indexer_lag_last_sample_age_seconds first — near zero means running but behind, climbing means stopped."
               dashboard: /d/nester-slo-balance/balance-freshness
               runbook: docs/observability/runbooks/balance-freshness.md
 

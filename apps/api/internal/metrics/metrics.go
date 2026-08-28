@@ -65,6 +65,11 @@ type Metrics struct {
 	// Service level indicators (nester#1056). Defined in slo.go; held here
 	// so one scrape carries both the infrastructure and the product view.
 	slo *sloCollectors
+
+	// Retry instrumentation for the chain RPC helper (nester#1086). Defined
+	// in rpc.go. These count logical calls, where the outbound collectors
+	// above count HTTP attempts.
+	rpc *rpcCollectors
 }
 
 // New builds the registry and registers every collector on it.
@@ -155,6 +160,7 @@ func New() *Metrics {
 		}, []string{"upstream", "kind"}),
 
 		slo: newSLOCollectors(),
+		rpc: newRPCCollectors(),
 	}
 
 	registry.MustRegister(
@@ -170,6 +176,7 @@ func New() *Metrics {
 	)
 
 	registry.MustRegister(m.slo.collectors()...)
+	registry.MustRegister(m.rpc.collectors()...)
 
 	// Process and Go runtime collectors: goroutine count, heap, GC pauses,
 	// open file descriptors, CPU. Free to collect and the first thing anyone

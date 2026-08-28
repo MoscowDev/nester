@@ -180,32 +180,84 @@ experiences them, so the SLI does too.
 
 | | |
 |---|---|
-| **Measurement** | network ledger tip − last successfully indexed ledger |
-| **Source** | `nester_indexer_lag_ledgers` |
-| **Acceptable** | ≤ 60 ledgers (~5 minutes) |
-| **Stale threshold** | lag sample older than 300s |
+| **Measurement** | age of the indexed view of the chain, in seconds and in ledgers |
+| **Source** | `nester_indexer_lag_seconds`, `nester_indexer_lag_ledgers` |
+| **Staleness budget** | **300s (5 minutes)** — `INDEXER_STALENESS_BUDGET`, default `5m` |
+| **Equivalent in ledgers** | ≤ 60 ledgers (60 × 5s close interval = 300s) |
+| **Stale** | `lag_seconds > budget`. Strictly greater: exactly at the budget is fresh. |
 
-Sampled inside the event-indexer loop from the tip that `fetchSorobanEvents`
-already returns, so it costs no extra RPC call. Measured in ledgers rather than
-seconds because the indexer's own unit is the ledger sequence; converting to
-time would bake in an assumed close interval that varies.
+#### The staleness budget
 
-**Missing-data behaviour is the important part of this SLI.** A lag gauge alone
-cannot distinguish "lag is 0" from "the sampler died and the value is frozen at
-its last write" — and the second silently reports perfect health, which is the
-worst possible failure for a freshness signal. Three mechanisms prevent it:
+There is **one** budget, and it governs three things that must never disagree:
+the alert that pages, the `X-Indexer-Stale` header the API returns to clients,
+and this document. The application exports the value it is enforcing as
+`nester_indexer_staleness_budget_seconds`, and `IndexerStalenessBudgetExceeded`
+compares lag against that series rather than against a literal, so retuning
+`INDEXER_STALENESS_BUDGET` moves the pager and the UI together.
 
-1. `nester_indexer_lag_last_sample_age_seconds` ages between successful
-   samples, so `IndexerLagStale` fires when the signal itself goes stale.
-2. `nester_indexer_lag_sample_errors_total` counts failed samples rather than
+**Why 300 seconds.** It is the pre-existing ledger-lag SLO restated in the unit
+the API contract needs, not a new number: 60 ledgers at a ~5s close interval is
+exactly 300s. Healthy operation sits an order of magnitude inside it — the
+indexer polls every 6s and advances its cursor to the tip it just read, so a
+healthy sample is a handful of ledgers behind and at most one poll old, well
+under 20s of staleness. The gap between that and 300s absorbs a slow RPC round
+trip, a rolling restart, and the 12-ledger cold-start rewind without paging,
+while still catching a user staring at a wrong balance within minutes.
+
+#### How staleness is calculated
+
+```
+lag_seconds = (now − last successful sample)
+            + (network tip − indexed ledger) × 5s
+```
+
+The second term is the lag the indexer last observed. The first term is how
+long it has been since it observed anything, and it is what makes this SLI
+trustworthy: **both terms are required.**
+
+Dropping the first would let the number freeze at a healthy value the moment
+the indexer died — lag 0, dashboards green, pager silent — which is the single
+most dangerous failure a freshness signal can have. Dropping the second would
+report a busily-polling but hopelessly-behind indexer as perfectly fresh.
+
+Because the first term grows on the clock, the value is **derived at scrape
+time from `internal/freshness`, not pushed by the indexer**. A dead indexer
+therefore produces a climbing number with nothing of ours still running to
+produce it, and `IndexerStalenessBudgetExceeded` fires whether the indexer is
+merely behind or has stopped completely.
+
+The 5s close interval is nominal and real ledgers vary by a few hundred
+milliseconds, so the seconds figure inherits that error. At the scale the
+budget operates on — minutes — it is immaterial.
+
+#### Missing data
+
+1. `nester_indexer_lag_seconds` is always present and always moving, so an
+   indexer that never started ages past the budget and pages rather than
+   reporting zero forever.
+2. `nester_indexer_lag_last_sample_age_seconds` separates "running but behind"
+   (near zero) from "stopped" (climbing) — the first thing the runbook reads.
+3. `nester_indexer_lag_sample_errors_total` counts failed samples rather than
    writing a sentinel lag, which would be indistinguishable from a real stall.
-3. `IndexerMetricsAbsent` fires on `absent(...)`, so deleting or breaking the
+   A failed sample never resets the sample age.
+4. `IndexerMetricsAbsent` fires on `absent(...)`, so deleting or breaking the
    metric cannot buy silence.
 
-**Cold start:** a zero cursor (never indexed, or wiped `system_state`) is
-skipped rather than published, because `tip − 0` would report the entire ledger
-history as lag and page on every fresh deploy. The staleness alert then fires
-instead, which is the honest signal for "this indexer has never run".
+**Cold start:** before the indexer has committed a cursor there is no position
+to report, so `nester_indexer_lag_ledgers` is **withheld** rather than
+published as zero — `tip − 0` would report the entire ledger history as lag,
+and a zero would claim the indexer is exactly at the tip, which is the value
+that looks most perfect. The seconds view ages from process start instead, so a
+fresh deployment gets exactly one budget of grace and an indexer that never
+starts still pages.
+
+#### Client contract
+
+Stale balances are still served, with `X-Indexer-Stale: true`, rather than
+turned into a 5xx: a stale balance a user is told about is far more useful than
+an error, and failing the request would take down screens that do not depend on
+indexed data at all. See [the metrics reference](metrics.md#indexer-freshness)
+for the headers.
 
 **No burn rate.** This is a gauge, not a ratio of events. Forcing it into
 burn-rate shape would produce a number that cannot be reasoned about during an
@@ -306,7 +358,7 @@ weekday and the attainment figure does not shift with which day you read it.
 | Deposit success | 99.5% | 0.5% | ~3h 22m | page |
 | Withdrawal success | 99.5% | 0.5% | ~3h 22m | page |
 | Deposit/withdrawal latency | 99% under 30s | 1% | ~6h 43m | ticket |
-| Balance freshness | ≤60 ledgers | n/a (gauge) | n/a | page |
+| Balance freshness | ≤300s staleness (≤60 ledgers) | n/a (gauge) | n/a | page |
 | Intelligence availability | 99% | 1% | ~6h 43m | ticket |
 | Intelligence TTFT | 95% under 3s | 5% | ~33h 36m | ticket |
 | Intelligence refusal | <30% over 6h | n/a (guardrail) | n/a | ticket |
@@ -560,6 +612,7 @@ changed without updating its arithmetic fails the build.
 | `IntelligenceTTFTFastBurn` | ticket | >67.2% of streams over 3s | [intelligence-latency](runbooks/intelligence-latency.md) |
 | `IntelligenceTTFTSlowBurn` | ticket | >28% over 6h | [intelligence-latency](runbooks/intelligence-latency.md) |
 | `IntelligenceRefusalRateHigh` | ticket | >30% refusals over 6h | [intelligence-refusal](runbooks/intelligence-refusal.md) |
+| `IndexerStalenessBudgetExceeded` | page | Staleness over the budget (300s) for 2m | [balance-freshness](runbooks/balance-freshness.md) |
 | `IndexerLagHigh` | page | Lag >60 ledgers for 5m | [balance-freshness](runbooks/balance-freshness.md) |
 | `IndexerLagStale` | page | Lag sample older than 5m | [balance-freshness](runbooks/balance-freshness.md) |
 | `IndexerMetricsAbsent` | page | Freshness series absent | [balance-freshness](runbooks/balance-freshness.md) |
@@ -659,7 +712,7 @@ produces.
 | SLO — API availability | `nester-slo-api` | Availability, status classes, slow routes, dependency health |
 | SLO — Deposits and withdrawals | `nester-slo-flow` | Both flows' success and latency, outcomes, Soroban health |
 | SLO — Intelligence | `nester-slo-intel` | Availability, TTFT, refusals by reason, provider health |
-| SLO — Balance freshness | `nester-slo-balance` | Indexer lag, sample age, sample errors |
+| SLO — Balance freshness | `nester-slo-balance` | Data staleness vs budget, indexer lag, sample age, sample errors |
 | SLO — Synthetic probes | `nester-slo-probes` | Probe outcome, duration, reasons, result age |
 
 Every SLO dashboard opens with the same four panels — **attainment, budget
@@ -714,10 +767,14 @@ alert storm. Alertmanager groups by `(slo, burn, service)`, all bounded.
 
 **Monitoring failures do not break the application:**
 
-- `RecordFlowAttempt` and the lag setters are nil-safe; a service constructed
-  without metrics behaves exactly as before.
+- `RecordFlowAttempt` is nil-safe; a service constructed without metrics
+  behaves exactly as before.
 - Indexer lag sampling is inside the existing loop with a nil-checked recorder;
-  it cannot stop the indexer from indexing.
+  it cannot stop the indexer from indexing, and a failed sample does not abort
+  the poll that follows it.
+- `freshness.Tracker` is nil-safe on every path, so an API wired without an
+  indexer serves requests unannotated rather than panicking in the request
+  path.
 - The Go metrics listener failing is logged and non-fatal.
 - The Prometheus handler uses `ContinueOnError`, so a broken collector degrades
   the scrape rather than 500ing the endpoint and blinding every other metric.

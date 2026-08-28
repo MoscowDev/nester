@@ -255,6 +255,130 @@ histogram_quantile(0.99,
   sum by (le, upstream) (rate(nester_outbound_request_duration_seconds_bucket[5m])))
 ```
 
+### Soroban RPC retries
+
+Source: `internal/metrics/rpc.go`, recorded by the shared retry helper in
+`internal/retry` via `internal/stellar`'s RPC client.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `nester_rpc_attempts_total` | Counter | `upstream` | Individual attempts, retries included. |
+| `nester_rpc_exhaustions_total` | Counter | `upstream` | Logical calls that used up their attempts or budget. |
+| `nester_rpc_call_duration_seconds` | Histogram | `upstream` | End-to-end latency of a logical call, retries and backoff included. |
+
+These describe **logical calls**; the outbound metrics above describe **HTTP
+attempts**. The pair is the useful signal:
+
+```promql
+# Average attempts per call. Moves long before anything fails outright, so
+# it is the earliest warning an upstream is degrading.
+rate(nester_rpc_attempts_total[5m])
+  / rate(nester_rpc_call_duration_seconds_count[5m])
+
+# Retries have stopped being enough — these reach the user as a 503.
+rate(nester_rpc_exhaustions_total[5m])
+
+# What a user actually waited, retries included.
+histogram_quantile(0.95,
+  sum by (le, upstream) (rate(nester_rpc_call_duration_seconds_bucket[5m])))
+```
+
+**Cardinality:** three metrics × the upstreams actually called. No method
+label — per-method detail comes from the `soroban.rpc/<method>` spans, which
+already carry it without minting series.
+
+**Only idempotent reads are retried.** `sendTransaction` is never repeated
+automatically; the write path's durability comes from the submission record.
+A `sendTransaction` still appears here with `attempts=1`, so the metrics cover
+every call rather than only the retryable ones.
+
+### Circuit breakers
+
+Source: `internal/metrics/breaker.go`, a pull collector over
+`internal/breaker`. See [circuit-breakers.md](circuit-breakers.md) for the
+state machine, the failure classification, and the operator guide.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `nester_circuit_breaker_state` | Gauge | `upstream` | 0 closed, 1 half-open, 2 open. |
+| `nester_circuit_breaker_failure_ratio` | Gauge | `upstream` | Failure ratio within the rolling window. |
+| `nester_circuit_breaker_rejected_total` | Counter | `upstream` | Requests rejected without contacting the upstream. |
+
+`upstream` is `soroban_rpc` or `horizon` — the same bounded constant set the
+outbound metrics use, never a URL or a host.
+
+**Cardinality:** three metrics × two upstreams = six series, fixed at startup.
+The breakers come from configuration, so nothing about a request can move the
+count. A test asserts both the series count and that every label value is one
+of the constants.
+
+State values ascend with severity, so `> 0` reads as "not fully healthy" and
+`max()` across replicas is the worst state rather than an arbitrary one.
+
+```promql
+# Any chain upstream being shed right now.
+max by (upstream) (nester_circuit_breaker_state) > 0
+
+# Load actually shed.
+sum by (upstream) (rate(nester_circuit_breaker_rejected_total[5m]))
+
+# Flapping: repeated open/half-open cycling means a marginal upstream.
+changes(nester_circuit_breaker_state[15m])
+```
+
+### Indexer freshness
+
+Source: `internal/metrics/freshness.go`, a pull collector over
+`internal/freshness`. Nothing here is pushed.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `nester_indexer_lag_seconds` | Gauge | none | Age of the indexed view of the chain. |
+| `nester_indexer_lag_ledgers` | Gauge | none | Network tip minus last indexed ledger. **Absent until the indexer reports a position.** |
+| `nester_indexer_staleness_budget_seconds` | Gauge | none | The budget the API is enforcing (`INDEXER_STALENESS_BUDGET`). |
+| `nester_indexer_lag_last_sample_age_seconds` | Gauge | none | Seconds since the indexer last reported a position. |
+| `nester_indexer_lag_sample_errors_total` | Counter | none | Failed sampling attempts. |
+
+**Cardinality:** five series, fixed. The freshness of the indexed view is a
+single process-wide fact, so there is nothing to break it down by and no way
+for traffic to move the count. A test asserts none of these carry a label.
+
+**Why a pull collector.** These were gauges the indexer pushed on each
+successful poll, which meant a dead indexer left every one of them frozen at
+its last healthy value — lag 0, sample age 0, alerts silent. Deriving them at
+scrape time means `lag_seconds` and `lag_last_sample_age_seconds` climb on the
+clock, so an indexer that has stopped is visible without anything of ours still
+having to run. This is the failure mode the balance-freshness SLI exists to
+catch, so it is worth the collector.
+
+`lag_seconds` is `(now − last sample) + ledger lag × 5s`; see
+[the SLO document](slo.md#5-balance-freshness) for why both terms are required.
+
+#### API response headers
+
+The same freshness model annotates every `/api/` response
+(`internal/middleware/freshness.go`), so a client can degrade honestly instead
+of presenting a stale balance as live. Stale data is still served with a 2xx —
+failing the request would tell the user nothing useful about their money.
+
+| Header | Meaning |
+| --- | --- |
+| `X-Indexer-Stale` | `true` / `false`. The authoritative answer; decided by the same budget the alert uses. |
+| `X-Indexer-Lag-Seconds` | Staleness in whole seconds, rounded **up** so it never understates. |
+| `X-Indexer-Lag-Ledgers` | Lag in ledgers. **Omitted** when the indexer has not reported a position — absent means "unknown", which a `0` would misreport as "exactly at the tip". |
+| `X-Indexer-Staleness-Budget-Seconds` | The budget the flag was decided against. |
+
+All four are listed in `Access-Control-Expose-Headers`, so a browser client on
+another origin can read them.
+
+```promql
+# Is the served data inside its budget?
+nester_indexer_lag_seconds <= nester_indexer_staleness_budget_seconds
+
+# Running but behind, or stopped? Near zero is behind; climbing is stopped.
+nester_indexer_lag_last_sample_age_seconds
+```
+
 ### Runtime
 
 The standard Go and process collectors are registered: `go_goroutines`,

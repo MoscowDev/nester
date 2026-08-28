@@ -296,6 +296,12 @@ func (h *TransactionHandler) writeDomainError(w http.ResponseWriter, r *http.Req
 		errors.Is(err, transaction.ErrInvalidStatus),
 		errors.Is(err, transaction.ErrInvalidType):
 		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr(err.Error()))
+	// Confirming a transaction reaches Horizon through the breaker-wrapped
+	// client, so an upstream outage surfaces here. Without this it fell to
+	// the default and answered 500, which reads as "the API is broken" for
+	// what is a retriable upstream condition (#1086).
+	case isUpstreamUnavailable(err):
+		writeUpstreamUnavailable(w, err)
 	default:
 		logpkg.FromContext(r.Context()).Error("transaction handler failed", "error", err.Error())
 		response.WriteJSON(w, http.StatusInternalServerError, response.Err(http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error"))

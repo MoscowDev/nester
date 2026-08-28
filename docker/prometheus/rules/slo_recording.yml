@@ -592,11 +592,35 @@ groups:
   # so healthy lag is a handful of ledgers. 60 is far enough above that to
   # tolerate a slow poll or a brief RPC stall without firing, and close enough
   # that a user seeing a stale balance is caught within minutes.
+  #
+  # The same budget stated in seconds is 60 * 5s = 300s, and that is the form
+  # the API and the staleness alert use (nester#1088). It is deliberately NOT
+  # written as a literal anywhere in this file: the application exports the
+  # budget it is actually enforcing as
+  # nester_indexer_staleness_budget_seconds, and the alert compares lag against
+  # that series. An operator who retunes INDEXER_STALENESS_BUDGET therefore
+  # moves the alert and the API's stale flag together, and the two cannot drift
+  # into disagreeing about whether balances are current.
+  #
+  # `max` across replicas rather than `avg`: freshness is a property of the
+  # data being served, and if any replica is serving stale balances, users are
+  # seeing stale balances. Averaging would let a healthy majority hide it.
   - name: slo_balance_freshness
     interval: 30s
     rules:
       - record: indexer:freshness:lag_ledgers
         expr: max(nester_indexer_lag_ledgers)
+
+      # Staleness in wall time: time since the last freshness sample plus that
+      # sample's ledger lag. Unlike lag_ledgers this series is always present
+      # and always moving, because the API derives it from the clock at scrape
+      # time rather than the indexer pushing it on a successful poll. That is
+      # what makes it able to catch an indexer that has stopped entirely.
+      - record: indexer:freshness:lag_seconds
+        expr: max(nester_indexer_lag_seconds)
+
+      - record: indexer:freshness:budget_seconds
+        expr: max(nester_indexer_staleness_budget_seconds)
 
       - record: indexer:freshness:sample_age_seconds
         expr: max(nester_indexer_lag_last_sample_age_seconds)

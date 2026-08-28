@@ -47,3 +47,17 @@ dev-logs: ## Tail logs for all services
 
 dev-db: ## Open a psql shell in the dev database
 	docker compose exec postgres psql -U nester nester_dev
+
+dev-seed: ## Apply scripts/seed.sql to the running dev database (re-runnable)
+	docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U nester nester_dev < scripts/seed.sql
+
+# The documented reset for #1122. Drops the schema, lets the API container
+# re-apply every migration on start, then loads the fixture set — so a
+# contributor whose database has drifted gets back to a known state without
+# guessing which migration they are missing.
+dev-db-reset: ## Recreate the dev schema, re-run migrations, and re-seed
+	docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U nester nester_dev 		-c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+	docker compose restart api
+	@echo "Waiting for migrations to apply..."
+	@until docker compose exec -T postgres psql -tA -U nester nester_dev 		-c "SELECT to_regclass('public.users')" | grep -q users; do sleep 1; done
+	$(MAKE) dev-seed

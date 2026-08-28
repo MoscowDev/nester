@@ -54,6 +54,16 @@ func NewTransactionService(repository transaction.Repository, horizonURL string)
 	}
 }
 
+// SetHTTPClient replaces the HTTP client used to confirm transactions against
+// Horizon. It exists so startup can install the metrics-instrumented,
+// circuit-broken transport; a nil client is ignored so callers need not
+// branch.
+func (s *TransactionService) SetHTTPClient(client *http.Client) {
+	if client != nil {
+		s.client = client
+	}
+}
+
 // SetBalanceApplier wires the vault balance applier used to credit/debit a
 // vault once a deposit/withdrawal is confirmed on-chain. Optional: when unset,
 // status is still reconciled but no balance is moved (used by tests that only
