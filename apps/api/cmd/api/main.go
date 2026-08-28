@@ -22,6 +22,7 @@ import (
 	migratedb "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/suncrestlabs/nester/apps/api/internal/auth"
+	"github.com/suncrestlabs/nester/apps/api/internal/breaker"
 	"github.com/suncrestlabs/nester/apps/api/internal/cache"
 	"github.com/suncrestlabs/nester/apps/api/internal/config"
 	cryptopkg "github.com/suncrestlabs/nester/apps/api/internal/crypto"
@@ -29,6 +30,7 @@ import (
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/nudge"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/transaction"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/usersignal"
+	"github.com/suncrestlabs/nester/apps/api/internal/freshness"
 	"github.com/suncrestlabs/nester/apps/api/internal/handler"
 	"github.com/suncrestlabs/nester/apps/api/internal/harvest"
 	"github.com/suncrestlabs/nester/apps/api/internal/metrics"
@@ -37,6 +39,7 @@ import (
 	"github.com/suncrestlabs/nester/apps/api/internal/oracle"
 	"github.com/suncrestlabs/nester/apps/api/internal/repository"
 	"github.com/suncrestlabs/nester/apps/api/internal/repository/postgres"
+	"github.com/suncrestlabs/nester/apps/api/internal/retry"
 	"github.com/suncrestlabs/nester/apps/api/internal/scheduler"
 	"github.com/suncrestlabs/nester/apps/api/internal/service"
 	performancesvc "github.com/suncrestlabs/nester/apps/api/internal/service/performance"
@@ -213,6 +216,43 @@ func run() error {
 	// Additional collectors still attach to it below.
 	appMetrics := metrics.New()
 
+	// Balance freshness (nester#1088). One tracker is the source of truth for
+	// the lag metrics, the staleness alert, and the freshness headers the API
+	// returns, so the pager and the UI can never disagree about whether
+	// balances are current. It is created here because the middleware chain
+	// below and the indexer goroutine further down both read it.
+	indexerFreshness := freshness.NewTracker(cfg.Indexer().StalenessBudget())
+	if err := appMetrics.RegisterFreshness(indexerFreshness); err != nil {
+		// Non-fatal: losing the freshness metrics must not stop the API from
+		// serving, and the API still reports staleness in its own headers.
+		baseLogger.Error("failed to register indexer freshness collector", "error", err)
+	}
+
+	// Circuit breakers for the chain upstreams (nester#1087). Built before the
+	// first chain client because every one of them is wired through
+	// chainHTTPClient below.
+	chainBreakers, err := newChainBreakers(cfg, appMetrics, baseLogger)
+	if err != nil {
+		return fmt.Errorf("init chain circuit breakers: %w", err)
+	}
+
+	// The bounded, jittered retry policy every Soroban RPC call site shares
+	// (nester#1086). One Runner and one policy for the whole process: a
+	// per-call-site policy is how behaviour drifted between call sites in the
+	// first place. Only idempotent reads are retried — the stellar package
+	// decides that per RPC method, and sendTransaction is never among them.
+	sorobanRPCOptions := stellarpkg.RPCOptions{
+		Runner:   retry.New(),
+		Policy:   cfg.RPCRetry().Policy(),
+		Observer: appMetrics.RPCRecorderFor(metrics.UpstreamSorobanRPC),
+	}
+	baseLogger.Info("soroban rpc retry policy",
+		"max_attempts", sorobanRPCOptions.Policy.MaxAttempts,
+		"base_delay", sorobanRPCOptions.Policy.BaseDelay.String(),
+		"max_delay", sorobanRPCOptions.Policy.MaxDelay.String(),
+		"budget", sorobanRPCOptions.Policy.Budget.String(),
+	)
+
 	vaultRepository := postgres.NewVaultRepository(db)
 	vaultService := service.NewVaultService(vaultRepository)
 	// Deposit and withdrawal SLIs (nester#1056).
@@ -229,6 +269,9 @@ func run() error {
 
 	transactionRepository := postgres.NewTransactionRepository(db)
 	transactionService := service.NewTransactionService(transactionRepository, cfg.Stellar().HorizonURL())
+	// Confirmation polling is the steadiest Horizon caller, so it is the
+	// traffic most worth shedding when Horizon degrades (nester#1087).
+	transactionService.SetHTTPClient(chainBreakers.client(appMetrics, 10*time.Second, metrics.UpstreamHorizon))
 	// Balance is moved only after a deposit/withdrawal is confirmed on-chain
 	// (issue #496); the vault repository applies it idempotently by tx hash.
 	transactionService.SetBalanceApplier(vaultRepository)
@@ -280,6 +323,11 @@ func run() error {
 	//   - Local: STELLAR_OPERATOR_SECRET is set here. Retained for local
 	//     development; see docs/security/signing-isolation.md for why it is not
 	//     the recommended production configuration.
+	// Durable chain-submission records (nester#1085). Created before any
+	// invoker, because every chain write is required to persist an intent
+	// through this store before it is sent.
+	submissionStore := stellarpkg.NewPostgresSubmissionStore(db)
+
 	var chainInvoker service.VaultChainInvoker
 	switch {
 	case cfg.Stellar().SigningIsolated():
@@ -304,6 +352,14 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("init isolated chain invoker: %w", err)
 		}
+		// The invoker calls Soroban RPC and Horizon through one client; the
+		// breaker routes per request URL, so the two stay independent.
+		inv.SetHTTPClient(chainBreakers.client(appMetrics, 30*time.Second, metrics.UpstreamSorobanRPC))
+		inv.SetRPCOptions(sorobanRPCOptions)
+		// Durable submission records (nester#1085): every chain write now
+		// persists an intent before it is sent, so a lost RPC response can
+		// never leave a transaction the system knows nothing about.
+		inv.SetSubmissionStore(submissionStore, baseLogger.WithGroup("chain-submission"))
 		chainInvoker = inv
 		vaultService.SetDepositInvoker(inv)
 		baseLogger.Info("signing is isolated: this process holds no operator key",
@@ -321,6 +377,12 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("init chain invoker: %w", err)
 		}
+		inv.SetHTTPClient(chainBreakers.client(appMetrics, 30*time.Second, metrics.UpstreamSorobanRPC))
+		inv.SetRPCOptions(sorobanRPCOptions)
+		// Durable submission records (nester#1085): every chain write now
+		// persists an intent before it is sent, so a lost RPC response can
+		// never leave a transaction the system knows nothing about.
+		inv.SetSubmissionStore(submissionStore, baseLogger.WithGroup("chain-submission"))
 		chainInvoker = inv
 		vaultService.SetDepositInvoker(inv)
 		baseLogger.Warn("signing key is held in the API process; " +
@@ -346,10 +408,11 @@ func run() error {
 	adminService.SetTemplateRepository(goalTemplateRepo)
 	adminHandler := handler.NewAdminHandler(adminService, userService)
 	adminHandler.SetEventSyncer(&stellarpkg.EventSyncer{
-		DB:      db,
-		SysRepo: systemStateRepository,
-		RPCURL:  cfg.Stellar().RPCURL(),
-		Logger:  baseLogger,
+		DB:         db,
+		SysRepo:    systemStateRepository,
+		RPCURL:     cfg.Stellar().RPCURL(),
+		Logger:     baseLogger,
+		RPCOptions: sorobanRPCOptions,
 	})
 	adminHandler.SetLeadership(schedulerLeadership)
 
@@ -359,10 +422,11 @@ func run() error {
 	// live-indexed events are processed identically.
 	backfillRepo := postgres.NewBackfillRepository(db)
 	backfillRunner := &stellarpkg.Runner{
-		DB:     db,
-		Repo:   backfillRepo,
-		RPCURL: cfg.Stellar().RPCURL(),
-		Logger: baseLogger.WithGroup("backfill"),
+		DB:         db,
+		Repo:       backfillRepo,
+		RPCURL:     cfg.Stellar().RPCURL(),
+		Logger:     baseLogger.WithGroup("backfill"),
+		RPCOptions: sorobanRPCOptions,
 	}
 	adminHandler.SetBackfillRunner(backfillRunner, backfillRepo)
 
@@ -413,6 +477,17 @@ func run() error {
 	// Issue #1141: support tooling to inspect a user's money-path state.
 	adminHandler.SetMoneyPathServices(portfolioService, transactionService, auditLogger)
 
+	// Global pause switch for the money path (#1120). Gates deposits and
+	// withdrawals independently, persisted so an engaged switch survives a
+	// restart, and audit-logged on every change.
+	//
+	// Attached to vaultService rather than passed through its constructor so
+	// the many services built for tests and tooling keep working unchanged:
+	// a service with no gate allows everything, exactly as before.
+	moneyPathSwitchService := service.NewMoneyPathSwitchService(
+		postgres.NewMoneyPathSwitchRepository(db), auditLogger)
+	vaultService.SetMoneyPathSwitches(moneyPathSwitchService)
+
 	activityEventRepo := postgres.NewActivityEventRepository(db)
 	nudgeHistoryRepo := postgres.NewNudgeHistoryRepository(db)
 	nudgeOutcomeService := service.NewNudgeOutcomeService(nudgeHistoryRepo)
@@ -425,9 +500,9 @@ func run() error {
 	// it lands in "other" and shows up as an unattributed series.
 	xlmProviders, fiatProvider := oracleService.Providers()
 	for _, provider := range xlmProviders {
-		instrumentRateProvider(appMetrics, provider)
+		instrumentRateProvider(appMetrics, chainBreakers, provider)
 	}
-	instrumentRateProvider(appMetrics, fiatProvider)
+	instrumentRateProvider(appMetrics, chainBreakers, fiatProvider)
 	rateHandler := handler.NewRateHandler(oracleService)
 
 	// maxWSConnsPerIP bounds simultaneous WebSocket connections from one
@@ -502,9 +577,10 @@ func run() error {
 		cfg.Stellar().NetworkPassphrase(),
 		"",
 	)
-	contractReader.SetHTTPClient(appMetrics.InstrumentClient(
-		&http.Client{Timeout: 30 * time.Second}, metrics.UpstreamSorobanRPC,
-	))
+	contractReader.SetHTTPClient(
+		chainBreakers.client(appMetrics, 30*time.Second, metrics.UpstreamSorobanRPC),
+	)
+	contractReader.SetRPCOptions(sorobanRPCOptions)
 
 	tracker := performancesvc.NewTracker(
 		performanceRepository,
@@ -726,6 +802,7 @@ func run() error {
 	userHandler.Register(mux)
 	notificationHandler.Register(mux)
 	adminHandler.Register(mux)
+	handler.NewMoneyPathSwitchHandler(moneyPathSwitchService).Register(mux)
 	authHandler.Register(mux)
 	rateHandler.Register(mux)
 	performanceHandler.Register(mux)
@@ -1360,21 +1437,28 @@ func run() error {
 			middleware.RecoverPanic(baseLogger)(
 				appMetrics.Middleware(mux)(
 					cors(
-						globalLimiter(
-							authRouteLimiter(
-								writeLimiter(
-									authenticator(
-										walletBinding(
-											idempotencyMiddleware(
-												costQuota(
-													settlementLimiter(
-														walletLimiter(
-															middleware.LimitRequestBody(1 * 1024 * 1024)(
-																middleware.Logging(baseLogger)(
-																	middleware.Tracing(
-																		cfg.Tracing().ServiceName(),
-																		cfg.Tracing().LatencyThreshold(),
-																	)(mux),
+						// Inside cors so its Access-Control-Expose-Headers
+						// covers the freshness headers, and outside every
+						// rejection layer so a rate-limited or unauthorised
+						// response still tells the client how current the
+						// indexed data is.
+						middleware.IndexerFreshness(indexerFreshness)(
+							globalLimiter(
+								authRouteLimiter(
+									writeLimiter(
+										authenticator(
+											walletBinding(
+												idempotencyMiddleware(
+													costQuota(
+														settlementLimiter(
+															walletLimiter(
+																middleware.LimitRequestBody(1 * 1024 * 1024)(
+																	middleware.Logging(baseLogger)(
+																		middleware.Tracing(
+																			cfg.Tracing().ServiceName(),
+																			cfg.Tracing().LatencyThreshold(),
+																		)(mux),
+																	),
 																),
 															),
 														),
@@ -1407,10 +1491,44 @@ func run() error {
 		"auto_migrate", cfg.Startup().EnableAutoMigrate(),
 	)
 
-	// Balance-freshness SLI (nester#1056): the indexer publishes its own lag
-	// from the network tip it already fetches, so the sample costs no extra
-	// RPC call.
-	stellarpkg.StartEventIndexerWithMetrics(shutdownCtx, baseLogger, db, systemStateRepository, cfg.Stellar().RPCURL(), appMetrics)
+	// Submission reconciler (nester#1085). It resolves pending chain writes
+	// by asking the chain about a specific transaction hash — the only thing
+	// in the system permitted to decide that a submission ended.
+	//
+	// Its chain lookup is a read-only invoker (nil signer), deliberately
+	// independent of whether this deployment can sign: submissions left
+	// pending by a previous deployment still need resolving, and reconciling
+	// requires no key material.
+	if reconcileLookup, err := stellarpkg.NewContractInvokerWithSigner(
+		cfg.Stellar().RPCURL(),
+		cfg.Stellar().HorizonURL(),
+		cfg.Stellar().NetworkPassphrase(),
+		nil,
+	); err != nil {
+		baseLogger.Error("failed to build submission reconciler chain lookup", "error", err)
+	} else {
+		reconcileLookup.SetHTTPClient(chainBreakers.client(appMetrics, 30*time.Second, metrics.UpstreamSorobanRPC))
+		reconcileLookup.SetRPCOptions(sorobanRPCOptions)
+
+		submissionReconciler := stellarpkg.NewSubmissionReconciler(
+			submissionStore, reconcileLookup, baseLogger.WithGroup("submission-reconciler"),
+		)
+		// Same leader gate the rebalancer and protocol-health jobs use, so
+		// one instance sweeps rather than every replica.
+		submissionReconciler.SetLeaderChecker(schedulerLeadership)
+		go submissionReconciler.Run(shutdownCtx)
+	}
+
+	// Balance-freshness SLI (nester#1056, nester#1088): the indexer samples
+	// its own position against the network tip on every tick and publishes it
+	// to the freshness tracker, which the metrics collector and the API
+	// freshness headers both read.
+	stellarpkg.StartEventIndexer(shutdownCtx, baseLogger, db, systemStateRepository, stellarpkg.IndexerOptions{
+		RPCURL:     cfg.Stellar().RPCURL(),
+		HTTPClient: chainBreakers.client(appMetrics, stellarpkg.IndexerRequestTimeout, metrics.UpstreamSorobanRPC),
+		RPCOptions: sorobanRPCOptions,
+		Recorder:   indexerFreshness,
+	})
 
 	// The metrics endpoint runs on its own listener so it is never reachable
 	// through the public port. It is not registered on mux at any point, so
@@ -1537,15 +1655,126 @@ type httpClientSetter interface {
 	SetHTTPClient(*http.Client)
 }
 
-// instrumentRateProvider installs a metrics-instrumented HTTP client on an
-// exchange-rate provider.
+// chainBreakerSet holds the circuit breakers guarding Soroban RPC and Horizon,
+// plus the router that dispatches an outbound request to the right one
+// (nester#1087).
+//
+// A nil set means the breakers are disabled, and every method on it degrades
+// to "no guard" so no call site needs to branch.
+type chainBreakerSet struct {
+	router *breaker.Router
+}
+
+// newChainBreakers builds one breaker per chain upstream, wires them to the
+// metrics collector, and returns the router the HTTP clients are built on.
+//
+// Two breakers, not one: Soroban RPC and Horizon fail independently, and a
+// Horizon outage shedding Soroban traffic would take deposits offline for a
+// dependency they do not need. They share a *policy* because both degrade the
+// same way, but never state.
+func newChainBreakers(cfg *config.Config, m *metrics.Metrics, logger *slog.Logger) (*chainBreakerSet, error) {
+	if !cfg.CircuitBreaker().Enabled() {
+		logger.Warn("chain circuit breakers are disabled; a degraded Soroban RPC or Horizon will not be shed")
+		return nil, nil
+	}
+
+	policy := cfg.CircuitBreaker().Policy()
+	onTransition := chainBreakerLogger(logger.WithGroup("circuit-breaker"))
+
+	sorobanBreaker := breaker.New(string(metrics.UpstreamSorobanRPC), policy, onTransition)
+	horizonBreaker := breaker.New(string(metrics.UpstreamHorizon), policy, onTransition)
+
+	router := breaker.NewRouter()
+	if err := router.Register(cfg.Stellar().RPCURL(), sorobanBreaker); err != nil {
+		return nil, err
+	}
+	if err := router.Register(cfg.Stellar().HorizonURL(), horizonBreaker); err != nil {
+		return nil, err
+	}
+
+	if err := m.RegisterBreakers(map[metrics.Upstream]metrics.BreakerReader{
+		metrics.UpstreamSorobanRPC: sorobanBreaker,
+		metrics.UpstreamHorizon:    horizonBreaker,
+	}); err != nil {
+		// Non-fatal, for the same reason as the freshness collector: losing
+		// the metric must not stop the API serving, and the breakers still
+		// protect the upstreams and still appear in /health/detailed.
+		logger.Error("failed to register circuit breaker collector", "error", err)
+	}
+
+	logger.Info("chain circuit breakers enabled",
+		"failure_ratio", policy.FailureRatio,
+		"min_requests", policy.MinRequests,
+		"window", policy.Window.String(),
+		"open_duration", policy.OpenDuration.String(),
+	)
+
+	return &chainBreakerSet{router: router}, nil
+}
+
+// chainBreakerLogger logs state transitions only.
+//
+// Rejections are deliberately not logged: an open breaker can reject thousands
+// of calls a second, and logging each one turns an upstream outage into a
+// logging outage. The rejection counter metric carries that volume instead.
+func chainBreakerLogger(logger *slog.Logger) breaker.TransitionFunc {
+	return func(name string, from, to breaker.State, snapshot breaker.Snapshot) {
+		attrs := []any{
+			"upstream", name,
+			"from", from.String(),
+			"to", to.String(),
+			"failure_ratio", snapshot.FailureRatio,
+			"observed_requests", snapshot.Total,
+		}
+
+		// Opening is the operator-visible event: chain calls are now being
+		// shed. Recovery and probing are informational.
+		if to == breaker.StateOpen {
+			logger.Warn("circuit breaker opened; shedding calls to upstream", attrs...)
+			return
+		}
+		logger.Info("circuit breaker state changed", attrs...)
+	}
+}
+
+// readers exposes the breakers for the health response, keyed by upstream.
+func (s *chainBreakerSet) readers() map[metrics.Upstream]*breaker.Breaker {
+	if s == nil {
+		return nil
+	}
+	out := make(map[metrics.Upstream]*breaker.Breaker, len(s.router.Breakers()))
+	for _, b := range s.router.Breakers() {
+		out[metrics.Upstream(b.Name())] = b
+	}
+	return out
+}
+
+// client returns an HTTP client for one chain upstream: metrics innermost,
+// breaker outermost.
+//
+// The order matters. A rejected call never reaches the metrics transport, so
+// it is not counted as an outbound request and does not plant a near-zero
+// sample in the latency histogram or a transport error under a made-up kind.
+// nester_outbound_* therefore keeps meaning "calls we actually made", and the
+// shed load is reported by the breaker's own rejection counter instead.
+func (s *chainBreakerSet) client(m *metrics.Metrics, timeout time.Duration, upstream metrics.Upstream) *http.Client {
+	client := m.InstrumentClient(&http.Client{Timeout: timeout}, upstream)
+	if s == nil {
+		return client
+	}
+	client.Transport = s.router.Transport(client.Transport)
+	return client
+}
+
+// instrumentRateProvider installs a metrics-instrumented, circuit-broken HTTP
+// client on an exchange-rate provider.
 //
 // The upstream label is derived from the provider's own Name(), which returns
 // a fixed string per implementation, so the label set stays bounded by the
 // number of provider types rather than by anything at runtime. An unknown
 // provider is still instrumented, under "other", so a new one is never
 // silently invisible.
-func instrumentRateProvider(m *metrics.Metrics, provider oracle.Provider) {
+func instrumentRateProvider(m *metrics.Metrics, breakers *chainBreakerSet, provider oracle.Provider) {
 	setter, ok := provider.(httpClientSetter)
 	if !ok {
 		return
@@ -1561,7 +1790,10 @@ func instrumentRateProvider(m *metrics.Metrics, provider oracle.Provider) {
 		upstream = metrics.UpstreamCoinGecko
 	}
 
-	setter.SetHTTPClient(m.InstrumentClient(&http.Client{Timeout: 10 * time.Second}, upstream))
+	// Every provider gets the same client factory. Only the chain upstreams
+	// have a breaker registered, so the router passes CoinGecko and DeFiLlama
+	// straight through — this issue scopes the breaker to Soroban and Horizon.
+	setter.SetHTTPClient(breakers.client(m, 10*time.Second, upstream))
 }
 
 func livenessHandler(ready *atomic.Bool) http.HandlerFunc {
@@ -1697,6 +1929,46 @@ type dependencyStatus struct {
 	LatencyMillis int64  `json:"latency_ms,omitempty"`
 	Error         string `json:"error,omitempty"`
 	LatestLedger  uint64 `json:"latest_ledger,omitempty"`
+
+	// CircuitBreaker reports whether calls to this dependency are currently
+	// being shed (nester#1087): "closed", "half_open", or "open". Omitted when
+	// the breakers are disabled, so the field's absence means "not guarded"
+	// rather than "guarded and healthy".
+	CircuitBreaker *breakerStatus `json:"circuit_breaker,omitempty"`
+}
+
+// breakerStatus is one breaker's state as it appears in the health response.
+//
+// It reports the ratio and sample size alongside the state because "open" on
+// its own does not tell an operator whether the upstream is badly broken or
+// marginally over the threshold, and that is the first thing they need.
+type breakerStatus struct {
+	State        string  `json:"state"`
+	FailureRatio float64 `json:"failure_ratio"`
+	Observed     int     `json:"observed_requests"`
+	Rejected     uint64  `json:"rejected_total"`
+	RetrySeconds float64 `json:"retry_in_seconds,omitempty"`
+}
+
+// breakerDegraded reports whether a breaker is shedding or about to probe.
+// Half-open counts: calls are still being rejected while the single probe runs.
+func breakerDegraded(s *breakerStatus) bool {
+	return s != nil && s.State != breaker.StateClosed.String()
+}
+
+func newBreakerStatus(b *breaker.Breaker) *breakerStatus {
+	if b == nil {
+		return nil
+	}
+
+	snapshot := b.Snapshot()
+	return &breakerStatus{
+		State:        snapshot.State.String(),
+		FailureRatio: snapshot.FailureRatio,
+		Observed:     snapshot.Total,
+		Rejected:     snapshot.Rejected,
+		RetrySeconds: snapshot.RetryIn.Seconds(),
+	}
 }
 
 type dbStatus struct {

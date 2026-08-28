@@ -443,22 +443,73 @@ groups:
   # continuous quantity, not a ratio of events, and forcing it into burn-rate
   # shape would produce a number with no meaning.
   #
-  # Three distinct alerts, because three distinct things go wrong and they need
-  # different responses:
+  # Four alerts, because four distinct things go wrong and they need different
+  # responses:
   #
-  #   IndexerLagHigh    — the indexer is running but falling behind.
-  #   IndexerLagStale   — the indexer stopped updating the gauge at all. This
-  #                       is the dangerous one: without it a crashed sampler
-  #                       leaves a frozen healthy value and the SLI reports
-  #                       perfect freshness forever.
+  #   IndexerStalenessBudgetExceeded — the staleness budget is blown. This is
+  #                       the authoritative one and the only one stated in the
+  #                       same terms as the API's stale flag, so a page here
+  #                       means clients are being told their balances are
+  #                       stale. It catches an indexer that is behind AND one
+  #                       that is dead, because its metric climbs on the clock.
+  #   IndexerLagHigh    — the indexer is running but falling behind, in
+  #                       ledgers. Kept as the diagnostic split: it fires only
+  #                       when the indexer is alive enough to report a
+  #                       position, which is what distinguishes "behind" from
+  #                       "stopped".
+  #   IndexerLagStale   — the indexer stopped reporting at all. Says "do not
+  #                       trust the ledger figure beside this".
   #   IndexerMetricsAbsent — the series vanished entirely (process gone, scrape
   #                       failing). Without this, deleting the metric would
   #                       silence every alert above it.
+  #
+  # All four carry slo: balance_freshness, so Alertmanager groups them into one
+  # notification during an incident rather than four pages.
   #
   # Together these ensure missing telemetry fails visibly rather than silently,
   # which is the requirement that matters most for a freshness signal.
   - name: slo_alerts_balance_freshness
     rules:
+      # The staleness budget alert (nester#1088).
+      #
+      # Note that neither side of this comparison is a literal. The right-hand
+      # side is the budget the API is actually enforcing, exported by the
+      # process itself, so this alert fires on exactly the condition that makes
+      # the API start returning X-Indexer-Stale: true. Writing 300 here instead
+      # would let the pager and the UI disagree the first time anyone retuned
+      # INDEXER_STALENESS_BUDGET.
+      #
+      # `for: 2m` rather than the 5m the ledger alert uses. The budget has
+      # already elapsed by the time this expression is true — five minutes of
+      # staleness have accumulated — so a long `for:` would add that delay
+      # again on top. Two minutes is enough to ride out a scrape gap or a
+      # rolling restart without letting a genuine stall sit unpaged.
+      - alert: IndexerStalenessBudgetExceeded
+        expr: |
+          indexer:freshness:lag_seconds > indexer:freshness:budget_seconds
+        for: 2m
+        labels:
+          severity: page
+          slo: balance_freshness
+          service: api
+        annotations:
+          summary: >-
+            Indexed balances are {{ $value | humanizeDuration }} out of date,
+            past the staleness budget
+          description: >-
+            The indexed view of the chain is {{ $value | humanizeDuration }}
+            old against a staleness budget of
+            {{ with query "indexer:freshness:budget_seconds" }}{{ . | first | value | humanizeDuration }}{{ end }}.
+            The API is now returning X-Indexer-Stale: true on every /api/
+            response, so clients are being told their balances are out of date.
+            This fires whether the indexer is merely behind or has stopped
+            completely: nester_indexer_lag_seconds is derived from the clock at
+            scrape time, so it keeps climbing with nothing running to push it.
+            Check nester_indexer_lag_last_sample_age_seconds first — near zero
+            means running but behind, climbing means stopped.
+          dashboard: /d/nester-slo-balance/balance-freshness
+          runbook: docs/observability/runbooks/balance-freshness.md
+
       - alert: IndexerLagHigh
         expr: indexer:freshness:lag_ledgers > 60
         for: 5m

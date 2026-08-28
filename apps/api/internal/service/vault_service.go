@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
+	"github.com/suncrestlabs/nester/apps/api/internal/domain/moneypath"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/vault"
 	"github.com/suncrestlabs/nester/apps/api/internal/metrics"
 )
@@ -59,12 +60,12 @@ func (c *sharePriceCache) invalidate(id uuid.UUID) {
 }
 
 type SharePriceResponse struct {
-	VaultID       string `json:"vault_id"`
-	SharesPerUSDC string `json:"shares_per_usdc"`
-	USDCPerShare  string `json:"usdc_per_share"`
-	TotalShares   string `json:"total_shares"`
+	VaultID         string `json:"vault_id"`
+	SharesPerUSDC   string `json:"shares_per_usdc"`
+	USDCPerShare    string `json:"usdc_per_share"`
+	TotalShares     string `json:"total_shares"`
 	TotalAssetsUSDC string `json:"total_assets_usdc"`
-	AsOfLedger    int64  `json:"as_of_ledger"`
+	AsOfLedger      int64  `json:"as_of_ledger"`
 }
 
 type ConvertRequest struct {
@@ -136,6 +137,32 @@ type VaultService struct {
 	// without it (tests, tooling) behaves exactly as before. Losing
 	// observability must never change the behaviour of the money path.
 	metrics *metrics.Metrics
+	// moneyPathSwitches gates deposits and withdrawals on the global pause
+	// switch (#1120). Optional: a nil gate allows everything, so a service
+	// built without one (tests, tooling) behaves as it did before the switch
+	// existed. Production wires it in SetMoneyPathSwitches.
+	moneyPathSwitches MoneyPathGate
+}
+
+// MoneyPathGate reports whether a money-path operation may proceed. Declared
+// here rather than taking *MoneyPathSwitchService so tests can substitute a
+// gate without a database.
+type MoneyPathGate interface {
+	EnsureAllowed(ctx context.Context, op moneypath.Operation) error
+}
+
+// SetMoneyPathSwitches installs the global pause gate.
+func (s *VaultService) SetMoneyPathSwitches(gate MoneyPathGate) {
+	s.moneyPathSwitches = gate
+}
+
+// ensureMoneyPathAllowed refuses the operation when its global switch is
+// engaged. A nil gate allows everything.
+func (s *VaultService) ensureMoneyPathAllowed(ctx context.Context, op moneypath.Operation) error {
+	if s.moneyPathSwitches == nil {
+		return nil
+	}
+	return s.moneyPathSwitches.EnsureAllowed(ctx, op)
 }
 
 // GoalYieldRouter lets VaultService honor a savings goal's per-goal
@@ -201,17 +228,17 @@ type RecordWithdrawalInput struct {
 }
 
 type RebalancePositionInput struct {
-	VaultID     uuid.UUID
-	UserID      uuid.UUID
+	VaultID      uuid.UUID
+	UserID       uuid.UUID
 	FromProtocol string
 	ToProtocol   string
-	Amount      decimal.Decimal
-	Currency    string
-	TxHash      string
+	Amount       decimal.Decimal
+	Currency     string
+	TxHash       string
 }
 
 type RebalancePositionResult struct {
-	Vault              vault.Vault
+	Vault               vault.Vault
 	FromProtocolBalance decimal.Decimal
 	ToProtocolBalance   decimal.Decimal
 }
@@ -354,6 +381,13 @@ func (s *VaultService) RecordDeposit(ctx context.Context, input RecordDepositInp
 	// denominator and inflate the reported success rate.
 	startedAt := time.Now()
 	defer func() { recordFlow(s.metrics, metrics.FlowDeposit, startedAt, err) }()
+
+	// Global pause (#1120). Checked before any validation so an engaged
+	// switch stops the operation regardless of what was submitted, and
+	// before the chain is touched.
+	if err := s.ensureMoneyPathAllowed(ctx, moneypath.OperationDeposit); err != nil {
+		return vault.Vault{}, err
+	}
 
 	if input.VaultID == uuid.Nil {
 		return vault.Vault{}, vault.ErrInvalidVault
@@ -624,6 +658,13 @@ func (s *VaultService) RecordWithdrawal(ctx context.Context, input RecordWithdra
 	// deferred rather than recorded on each return path.
 	startedAt := time.Now()
 	defer func() { recordFlow(s.metrics, metrics.FlowWithdrawal, startedAt, err) }()
+
+	// Global pause (#1120), independent of the deposit switch: the common
+	// incident response is to stop money entering while still letting users
+	// take theirs out.
+	if err := s.ensureMoneyPathAllowed(ctx, moneypath.OperationWithdrawal); err != nil {
+		return vault.Vault{}, err
+	}
 
 	if input.VaultID == uuid.Nil {
 		return vault.Vault{}, vault.ErrInvalidVault
@@ -1103,12 +1144,12 @@ func (s *VaultService) RebalancePosition(ctx context.Context, input RebalancePos
 	}
 
 	err = s.repository.RecordRebalance(ctx, vault.RebalanceRecordInput{
-		VaultID:              input.VaultID,
-		UserID:               input.UserID,
-		FromProtocol:         input.FromProtocol,
-		ToProtocol:           input.ToProtocol,
-		Amount:               input.Amount,
-		TransactionHash:      input.TxHash,
+		VaultID:         input.VaultID,
+		UserID:          input.UserID,
+		FromProtocol:    input.FromProtocol,
+		ToProtocol:      input.ToProtocol,
+		Amount:          input.Amount,
+		TransactionHash: input.TxHash,
 	}, withdrawRecord, depositRecord)
 	if err != nil {
 		return RebalancePositionResult{}, err
@@ -1131,7 +1172,7 @@ func (s *VaultService) RebalancePosition(ctx context.Context, input RebalancePos
 	}
 
 	return RebalancePositionResult{
-		Vault:              updatedVault,
+		Vault:               updatedVault,
 		FromProtocolBalance: fromBalance,
 		ToProtocolBalance:   toBalance,
 	}, nil

@@ -11,6 +11,10 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+
+	"github.com/suncrestlabs/nester/apps/api/internal/breaker"
+	"github.com/suncrestlabs/nester/apps/api/internal/freshness"
+	"github.com/suncrestlabs/nester/apps/api/internal/retry"
 )
 
 // defaultDevJWTSecret is the placeholder value shipped in .env.example. It is long
@@ -58,6 +62,48 @@ type Config struct {
 	schedulerLeadership   SchedulerLeadershipConfig
 	tracing               TracingConfig
 	metrics               MetricsConfig
+	indexer               IndexerConfig
+	circuitBreaker        CircuitBreakerConfig
+	rpcRetry              RPCRetryConfig
+}
+
+// CircuitBreakerConfig is the policy protecting the chain upstreams, Soroban
+// RPC and Horizon (nester#1087).
+//
+// One policy, two independent breakers. The thresholds are shared because both
+// upstreams degrade the same way and there is no evidence for different
+// numbers; the failure *state* is strictly separate, so a Horizon outage never
+// sheds Soroban traffic. See docs/observability/circuit-breakers.md.
+type CircuitBreakerConfig struct {
+	enabled      bool
+	failureRatio float64
+	minRequests  int
+	window       time.Duration
+	openDuration time.Duration
+}
+
+// RPCRetryConfig is the bounded, jittered retry policy shared by every Soroban
+// RPC call site (nester#1086).
+//
+// It applies only to idempotent reads. Writes are never retried here — a
+// resubmitted transaction is a second attempt to move real money — and go
+// through the submission record instead.
+type RPCRetryConfig struct {
+	maxAttempts int
+	baseDelay   time.Duration
+	maxDelay    time.Duration
+	budget      time.Duration
+}
+
+// IndexerConfig holds the event indexer's freshness contract (nester#1088).
+//
+// The staleness budget is a single number with three consumers — the
+// `nester_indexer_staleness_budget_seconds` metric the alert compares against,
+// the `X-Indexer-Stale` header the API returns, and the SLO documentation —
+// so that the pager, the UI, and the runbook can never disagree about whether
+// balances are current.
+type IndexerConfig struct {
+	stalenessBudget time.Duration
 }
 
 // TracingConfig holds the OpenTelemetry tracing settings (nester#1054).
@@ -416,6 +462,27 @@ func Load() (*Config, error) {
 			// host port.
 			addr: loader.stringDefault("METRICS_ADDR", "127.0.0.1:9090"),
 		},
+		indexer: IndexerConfig{
+			stalenessBudget: loader.durationDefault("INDEXER_STALENESS_BUDGET", freshness.DefaultBudget),
+		},
+		circuitBreaker: CircuitBreakerConfig{
+			// A kill switch, because a resilience mechanism can itself cause
+			// an outage if its thresholds are wrong for a given environment.
+			// Turning it off must not require a code change.
+			enabled:      loader.boolDefault("CIRCUIT_BREAKER_ENABLED", true),
+			failureRatio: loader.floatDefault("CIRCUIT_BREAKER_FAILURE_RATIO", breaker.DefaultFailureRatio),
+			minRequests:  loader.intDefault("CIRCUIT_BREAKER_MIN_REQUESTS", breaker.DefaultMinRequests),
+			window:       loader.durationDefault("CIRCUIT_BREAKER_WINDOW", breaker.DefaultWindow),
+			openDuration: loader.durationDefault("CIRCUIT_BREAKER_OPEN_DURATION", breaker.DefaultOpenDuration),
+		},
+		rpcRetry: RPCRetryConfig{
+			// 1 disables retrying without disabling the helper: the metrics
+			// and the typed error stay, only the second attempt goes away.
+			maxAttempts: loader.intDefault("RPC_RETRY_MAX_ATTEMPTS", retry.DefaultMaxAttempts),
+			baseDelay:   loader.durationDefault("RPC_RETRY_BASE_DELAY", retry.DefaultBaseDelay),
+			maxDelay:    loader.durationDefault("RPC_RETRY_MAX_DELAY", retry.DefaultMaxDelay),
+			budget:      loader.durationDefault("RPC_RETRY_BUDGET", retry.DefaultBudget),
+		},
 	}
 
 	if cfg.bankAccountCipherKey == "" && environment == "development" {
@@ -443,6 +510,48 @@ func (c Config) Server() ServerConfig {
 
 func (c Config) Metrics() MetricsConfig {
 	return c.metrics
+}
+
+func (c Config) Indexer() IndexerConfig {
+	return c.indexer
+}
+
+func (c Config) CircuitBreaker() CircuitBreakerConfig {
+	return c.circuitBreaker
+}
+
+// Enabled reports whether chain calls are guarded. When false the breakers are
+// not installed at all and every request goes straight to the upstream.
+func (b CircuitBreakerConfig) Enabled() bool { return b.enabled }
+
+func (c Config) RPCRetry() RPCRetryConfig {
+	return c.rpcRetry
+}
+
+// Policy returns the retry policy this configuration describes.
+func (r RPCRetryConfig) Policy() retry.Policy {
+	return retry.Policy{
+		MaxAttempts: r.maxAttempts,
+		BaseDelay:   r.baseDelay,
+		MaxDelay:    r.maxDelay,
+		Budget:      r.budget,
+	}
+}
+
+// Policy returns the breaker policy this configuration describes.
+func (b CircuitBreakerConfig) Policy() breaker.Config {
+	return breaker.Config{
+		FailureRatio: b.failureRatio,
+		MinRequests:  b.minRequests,
+		Window:       b.window,
+		OpenDuration: b.openDuration,
+	}
+}
+
+// StalenessBudget is how far behind the chain indexed data may fall before the
+// API reports it stale and the alert pages.
+func (i IndexerConfig) StalenessBudget() time.Duration {
+	return i.stalenessBudget
 }
 
 // Enabled reports whether the internal metrics listener should be started.
@@ -965,6 +1074,29 @@ func (c *Config) validate(loader *envLoader) {
 
 	if c.apyRefresh.broadcastThresholdBPS < 0 {
 		loader.addError("APY_BROADCAST_THRESHOLD must not be negative")
+	}
+
+	// A non-positive budget would mark every response stale and hold the
+	// staleness alert permanently firing, so it is refused at startup rather
+	// than discovered when the pager will not stop.
+	if c.indexer.stalenessBudget <= 0 {
+		loader.addError("INDEXER_STALENESS_BUDGET must be greater than 0")
+	}
+
+	// Only meaningful when the breakers are actually installed; a disabled
+	// breaker's thresholds are never read, so they must not block startup.
+	// The policy owns the rules, so they are stated once rather than
+	// duplicated here and left to drift.
+	if c.circuitBreaker.enabled {
+		if err := c.circuitBreaker.Policy().Validate(); err != nil {
+			loader.addError("CIRCUIT_BREAKER_* configuration is invalid: " + err.Error())
+		}
+	}
+
+	// The policy owns the rules, so they are stated once rather than
+	// duplicated here and left to drift.
+	if err := c.rpcRetry.Policy().Validate(); err != nil {
+		loader.addError("RPC_RETRY_* configuration is invalid: " + err.Error())
 	}
 
 	if c.transactionPoller.interval <= 0 {

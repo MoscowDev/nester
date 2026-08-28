@@ -25,6 +25,7 @@ import (
 // the default unit-test job rather than only where PostgreSQL is available.
 type stubSysRepo struct {
 	values map[string]string
+	getErr error
 	setErr error
 }
 
@@ -33,6 +34,9 @@ func newStubSysRepo() *stubSysRepo {
 }
 
 func (s *stubSysRepo) Get(_ context.Context, key string) (string, error) {
+	if s.getErr != nil {
+		return "", s.getErr
+	}
 	v, ok := s.values[key]
 	if !ok {
 		return "", systemstate.ErrKeyNotFound
