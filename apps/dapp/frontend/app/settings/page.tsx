@@ -181,7 +181,11 @@ interface KYCStatusResponse {
   rejection_reason?: string;
 }
 
-function useKYCState(userId: string | undefined) {
+// No userId parameter: every call inside goes to /api/v1/users/me/kyc,
+// which resolves the user from the session. The parameter was declared
+// and never read, and the call site passed nothing, so the build failed
+// with "Expected 1 arguments, but got 0".
+function useKYCState() {
   const [status, setStatus] = useState<KYCStatus>("unverified");
   const [submittedAt, setSubmittedAt] = useState<string | null>(null);
   const [reviewedAt, setReviewedAt] = useState<string | null>(null);
