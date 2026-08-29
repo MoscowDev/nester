@@ -87,7 +87,6 @@ jobs:
       - name: Lint website
         run: pnpm --filter @nester/website lint
 
-
   intelligence:
     name: Intelligence (Python)
     needs: changes
@@ -116,7 +115,6 @@ jobs:
 
       - name: Test
         run: pytest
-
 
   dapp-frontend:
     name: Dapp Frontend (Next.js)
@@ -216,7 +214,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install promtool and amtool
         run: |
@@ -490,6 +488,11 @@ jobs:
           TEST_DATABASE_DSN: postgres://nester:nester@localhost:5432/nester_test?sslmode=disable
         run: go test -race -timeout 900s -count=1 -p 1 ./...
 
+      - name: Test (property-based vault arithmetic)
+        env:
+          RAPID_CHECKS: "32"
+          RAPID_SEED: "29062026"
+        run: go test -timeout 60s -run PropertyBased -v ./internal/domain/vault
 
   contracts:
     name: Contracts (Rust)
@@ -508,7 +511,6 @@ jobs:
 
       - name: Add wasm32-unknown-unknown target
         run: rustup target add wasm32-unknown-unknown
-
 
       - name: Build yield_registry WASM
         run: cargo build --release --target wasm32-unknown-unknown -p yield-registry-contract
@@ -556,4 +558,3 @@ jobs:
             echo "ERROR: No vault-contract tests ran — possible missing WASM artifact"
             exit 1
           fi
-

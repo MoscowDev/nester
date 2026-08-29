@@ -183,3 +183,86 @@ func TestUserHandler_GetEndpoints(t *testing.T) {
 		t.Errorf("expected 200 OK, got %d", resp3.StatusCode)
 	}
 }
+
+// TestUserHandler_KYCSubmissionAndRetrieval verifies that KYC submission
+// reaches the API endpoint and persists status for retrieval.
+func TestUserHandler_KYCSubmissionAndRetrieval(t *testing.T) {
+	repo := newMockUserRepository()
+	svc := service.NewUserService(repo)
+	handler := NewUserHandler(svc)
+
+	mux := http.NewServeMux()
+	handler.Register(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Create a user
+	u, _ := svc.RegisterUser(context.Background(), "G-KYC-TEST", "Bob")
+
+	// Submit KYC with multipart form
+	body := new(bytes.Buffer)
+
+	// Create a minimal multipart form manually
+	formBody := `--boundary
+Content-Disposition: form-data; name="full_name"
+
+Bob Smith
+--boundary
+Content-Disposition: form-data; name="date_of_birth"
+
+1990-01-15
+--boundary
+Content-Disposition: form-data; name="country"
+
+US
+--boundary
+Content-Disposition: form-data; name="id_type"
+
+passport
+--boundary
+Content-Disposition: form-data; name="id_number"
+
+12345678
+--boundary
+Content-Disposition: form-data; name="id_front"; filename="passport_front.jpg"
+Content-Type: image/jpeg
+
+[fake image data]
+--boundary--`
+
+	// Submit KYC
+	req, err := http.NewRequest("POST", server.URL+"/api/v1/users/kyc/"+u.ID.String(), bytes.NewBufferString(formBody))
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=boundary")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST KYC submission failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("expected 202 Accepted, got %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		t.Logf("response body: %s", body)
+	}
+
+	// Retrieve KYC status
+	getResp, err := http.Get(server.URL + "/api/v1/users/kyc/" + u.ID.String())
+	if err != nil {
+		t.Fatalf("GET KYC status failed: %v", err)
+	}
+	defer getResp.Body.Close()
+
+	if getResp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK, got %d", getResp.StatusCode)
+	}
+
+	// Parse response and verify status is pending
+	respBody, _ := io.ReadAll(getResp.Body)
+	if !bytes.Contains(respBody, []byte("pending")) {
+		t.Errorf("expected 'pending' status in response, got: %s", respBody)
+	}
+}

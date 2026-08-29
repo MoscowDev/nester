@@ -58,6 +58,8 @@ func (h *UserHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/users/wallet/{address}", h.getUserByWallet)
 	mux.HandleFunc("POST /api/v1/users/kyc/{id}", h.submitKYC)
 	mux.HandleFunc("GET /api/v1/users/kyc/{id}", h.getKYCStatus)
+	mux.HandleFunc("POST /api/v1/users/me/kyc", h.submitKYCMe)
+	mux.HandleFunc("GET /api/v1/users/me/kyc", h.getKYCStatusMe)
 	mux.HandleFunc("GET /api/v1/users/profile", h.getProfile)
 	mux.HandleFunc("PATCH /api/v1/users/profile", h.updateProfile)
 	mux.HandleFunc("GET /api/v1/user-vaults/{id}", h.listUserVaultsForIntelligence)
@@ -360,6 +362,89 @@ func (h *UserHandler) getKYCStatus(w http.ResponseWriter, r *http.Request) {
 	userID, err := uuid.Parse(idStr)
 	if err != nil {
 		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("invalid user ID"))
+		return
+	}
+
+	model, err := h.service.GetUser(r.Context(), userID)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	resp := map[string]any{
+		"status": model.KYCStatus,
+	}
+	if model.KYCSubmittedAt != nil {
+		resp["submitted_at"] = model.KYCSubmittedAt
+	}
+	if model.KYCReviewedAt != nil {
+		resp["reviewed_at"] = model.KYCReviewedAt
+	}
+	if model.KYCRejectionReason != nil {
+		resp["rejection_reason"] = model.KYCRejectionReason
+	}
+
+	response.WriteJSON(w, http.StatusOK, response.OK(resp))
+}
+
+// submitKYCMe submits KYC data for the authenticated user (no user ID param needed).
+func (h *UserHandler) submitKYCMe(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.authenticatedUserID(w, r)
+	if !ok {
+		return
+	}
+
+	// Reuse the same submitKYC logic
+	r.Body = http.MaxBytesReader(w, r.Body, maxKYCUploadBytes)
+	if err := r.ParseMultipartForm(kycInMemoryBytes); err != nil {
+		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("could not parse multipart form"))
+		return
+	}
+
+	fullName := r.FormValue("full_name")
+	dateOfBirth := r.FormValue("date_of_birth")
+	country := r.FormValue("country")
+	idType := r.FormValue("id_type")
+	idNumber := r.FormValue("id_number")
+
+	if idType == "" || idNumber == "" {
+		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("id_type and id_number are required"))
+		return
+	}
+
+	idFrontFile, idFrontHeader, err := r.FormFile("id_front")
+	if err != nil {
+		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("id_front is required"))
+		return
+	}
+	defer idFrontFile.Close()
+
+	frontKey := "s3://mock-bucket/" + idFrontHeader.Filename
+
+	var backKey *string
+	idBackFile, idBackHeader, err := r.FormFile("id_back")
+	if err == nil {
+		defer idBackFile.Close()
+		bk := "s3://mock-bucket/" + idBackHeader.Filename
+		backKey = &bk
+	}
+
+	_ = fullName
+	_ = dateOfBirth
+	_ = country
+
+	if err := h.service.SubmitKYC(r.Context(), userID, idType, idNumber, frontKey, backKey); err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	response.WriteJSON(w, http.StatusAccepted, response.OK(map[string]string{"status": "pending"}))
+}
+
+// getKYCStatusMe retrieves KYC status for the authenticated user.
+func (h *UserHandler) getKYCStatusMe(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.authenticatedUserID(w, r)
+	if !ok {
 		return
 	}
 
