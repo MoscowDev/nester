@@ -512,7 +512,13 @@ export function useWebSocket({
     if (connectedTokenRef.current === currentToken) return;
     attemptsRef.current = 0;
     connectRef.current();
-  }, []);
+    // Deliberately no dependency array: the token is read from a ref, so
+    // there is no value React could watch. With `[]` this ran once on mount
+    // and never again, which meant a refreshed token kept the old socket
+    // open — authenticated as the previous credential — until something else
+    // happened to drop it. The guard above makes the re-run cheap: it
+    // returns immediately unless the token actually changed.
+  });
 
   // Suspend/resume. Two things bring a dropped connection back:
   //
