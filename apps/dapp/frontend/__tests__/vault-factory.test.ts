@@ -85,27 +85,26 @@ describe("VaultFactory.createVault", () => {
         description: undefined,
       };
 
-      // Mock the createVault function to avoid actual contract calls
-      vi.mock("@/lib/stellar/vault-factory", async () => {
-        const actual = await vi.importActual(
-          "@/lib/stellar/vault-factory"
-        );
-        return {
-          ...actual,
-          createVault: vi.fn().mockRejectedValue(
-            new Error("NEXT_PUBLIC_VAULT_FACTORY_CONTRACT_ID is not configured")
-          ),
-        };
-      });
-
+      // No mock here. vi.mock is hoisted to module scope by vitest, so
+      // calling it inside a test body does nothing — the real code path ran
+      // regardless, and would have reached the network if the contract id
+      // were set. The assertion below does not need a mock anyway: with no
+      // NEXT_PUBLIC_VAULT_FACTORY_CONTRACT_ID configured the real function
+      // fails on the missing config before it touches the chain, which is
+      // exactly what this test wants to observe.
       const result = await VaultFactory.createVault(
         validData,
         undefined,
         validParams
       );
 
-      // The error should be about missing factory config, not validation
-      expect(result.error).toContain("factory");
+      // An undefined description is valid, so the failure must come from the
+      // missing factory config rather than from validation. Matched
+      // case-insensitively: the error names the env var in upper case
+      // (NEXT_PUBLIC_VAULT_FACTORY_CONTRACT_ID), so toContain("factory")
+      // could never match.
+      expect(result.success).toBe(false);
+      expect(result.error?.toLowerCase()).toContain("factory");
     });
 
     it("rejects null data with object error", async () => {

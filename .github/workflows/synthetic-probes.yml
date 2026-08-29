@@ -70,6 +70,17 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
+            # Surfaced in the job summary, not only as an annotation. The
+            # guard requires all five secrets, so a partially-configured
+            # environment disables every probe while the workflow still
+            # reports green — the state most likely to be mistaken for
+            # "probes are running and finding nothing".
+            {
+              echo "### Synthetic probes skipped"
+              echo
+              echo "Not all STAGING_PROBE_* secrets are configured, so no probe ran."
+              echo "Monitoring is **not** active for this run. See docs/ci/secrets.md."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Run synthetic probes

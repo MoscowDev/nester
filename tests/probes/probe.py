@@ -447,10 +447,16 @@ def main(argv: list[str] | None = None) -> int:
         _require_safe_target(config)
         names = select_probes(config)
     except ProbeAbort as exc:
-        # Write failure metrics before exiting so alerting can report the misconfiguration.
-        # Use a synthetic failure result for the first known probe (balance).
+        # Write failure metrics before exiting so alerting can report the
+        # misconfiguration.
+        #
+        # Reported under its own name rather than borrowing "balance": a
+        # synthetic balance failure is indistinguishable from a real balance
+        # outage on the dashboard, so a misconfigured probe run would page
+        # whoever is on call for a problem that does not exist. A distinct
+        # series lets the alert rule say "the probes are broken" instead.
         fallback_result = ProbeResult(
-            name="balance",
+            name="probe_configuration",
             success=False,
             duration_seconds=0.0,
             reason="configuration",

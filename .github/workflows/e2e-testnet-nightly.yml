@@ -71,11 +71,16 @@ jobs:
           STAGING_URL: ${{ inputs.staging_url || vars.STAGING_URL }}
           CI: "true"
         run: |
+          # Skip rather than fail. This runs on a nightly schedule, so a
+          # hard failure means a red build every night until someone
+          # provisions testnet credentials — which trains people to ignore
+          # the notification rather than act on it. A notice is visible in
+          # the run summary without being a false alarm, and matches the
+          # spec's own skip guard.
           if [ -z "$TESTNET_WALLET_ADDRESS" ]; then
-            echo "::error::TESTNET_WALLET_ADDRESS is not configured. This secret is required for testnet E2E tests."
-            echo "Set it in GitHub repository settings: Settings → Secrets and variables → Actions → TESTNET_WALLET_ADDRESS"
-            echo "See docs/ci/secrets.md for details."
-            exit 1
+            echo "::notice::TESTNET_WALLET_ADDRESS is not configured; skipping the testnet E2E run."
+            echo "Set it under Settings → Secrets and variables → Actions. See docs/ci/secrets.md."
+            exit 0
           fi
 
           pnpm test:e2e:testnet
