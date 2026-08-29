@@ -513,7 +513,10 @@ func TestSettlementHandler_PostRejectsOverWithdrawal(t *testing.T) {
 	}
 
 	// Verify no settlement was created by checking the response body
-	body := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
 	if len(body) > 0 {
 		t.Logf("Response body: %s", string(body))
 	}

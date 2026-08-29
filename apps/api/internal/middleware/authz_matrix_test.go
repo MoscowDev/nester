@@ -120,6 +120,10 @@ var authzMatrix = []AuthzRoute{
 	{Method: "GET", Path: "/api/v1/yields/", Public: true},
 	{Method: "GET", Path: "/api/v1/yields/00000000-0000-0000-0000-000000000000", Public: true},
 
+	// ── KYC for the authenticated user (#1231) ─────────────────────────
+	{Method: "POST", Path: "/api/v1/users/me/kyc"},
+	{Method: "GET", Path: "/api/v1/users/me/kyc"},
+
 	// ── Money-path pause switches (#1120) ──────────────────────────────
 	{Method: "GET", Path: "/api/v1/admin/money-path/switches", RequireRole: "admin"},
 	{Method: "PUT", Path: "/api/v1/admin/money-path/switches/deposit", RequireRole: "admin"},

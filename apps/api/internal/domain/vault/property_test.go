@@ -387,7 +387,7 @@ func TestPropertyBasedEmptyVaultFirstDeposit(t *testing.T) {
 		shares := model.Deposit(0, decimal.NewFromInt(amount))
 
 		if !shares.Equal(decimal.NewFromInt(amount)) {
-			t.Fatalf("first deposit should be 1:1: deposited %s, minted %s", amount, shares)
+			t.Fatalf("first deposit should be 1:1: deposited %d, minted %s", amount, shares)
 		}
 	})
 }

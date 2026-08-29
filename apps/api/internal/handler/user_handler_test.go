@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/suncrestlabs/nester/apps/api/internal/crypto"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/user"
 	"github.com/suncrestlabs/nester/apps/api/internal/middleware"
+	"github.com/suncrestlabs/nester/apps/api/internal/objectstorage"
 	"github.com/suncrestlabs/nester/apps/api/internal/service"
 )
 
@@ -188,8 +190,26 @@ func TestUserHandler_GetEndpoints(t *testing.T) {
 // reaches the API endpoint and persists status for retrieval.
 func TestUserHandler_KYCSubmissionAndRetrieval(t *testing.T) {
 	repo := newMockUserRepository()
-	svc := service.NewUserService(repo)
+
+	// The KYC path encrypts the id number before persisting it, so the
+	// service needs a cipher — without one the submission fails with a 500.
+	cipher, err := crypto.NewAccountCipher(testCipherKey(7))
+	if err != nil {
+		t.Fatalf("NewAccountCipher() error = %v", err)
+	}
+	svc := service.NewUserService(repo).WithCipher(cipher)
 	handler := NewUserHandler(svc)
+
+	// A document store is required: the handler rejects an upload with 503
+	// rather than accepting a KYC record that points at nothing (#1191).
+	// Without this the route answers STORAGE_UNAVAILABLE and the submission
+	// never reaches the service, which is correct behaviour, not a bug in
+	// the endpoint.
+	store, err := objectstorage.NewLocalDiskStore(t.TempDir(), 8<<20, KYCAllowedContentTypes)
+	if err != nil {
+		t.Fatalf("NewLocalDiskStore() error = %v", err)
+	}
+	handler.SetKYCStore(store)
 
 	mux := http.NewServeMux()
 	handler.Register(mux)
@@ -199,10 +219,9 @@ func TestUserHandler_KYCSubmissionAndRetrieval(t *testing.T) {
 	// Create a user
 	u, _ := svc.RegisterUser(context.Background(), "G-KYC-TEST", "Bob")
 
-	// Submit KYC with multipart form
-	body := new(bytes.Buffer)
-
-	// Create a minimal multipart form manually
+	// Submit KYC with a hand-built multipart form. formBody below carries
+	// the payload; the bytes.Buffer this used to allocate was never written
+	// to or read, which is what the compiler was objecting to.
 	formBody := `--boundary
 Content-Disposition: form-data; name="full_name"
 

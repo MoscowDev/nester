@@ -248,6 +248,16 @@ func (h *UserHandler) submitKYC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.submitKYCFor(w, r, userID)
+}
+
+// submitKYCFor runs the KYC submission for an already-resolved user id.
+// Shared by submitKYC (id from the path) and submitKYCMe (id from the
+// session) so the two routes cannot drift — an earlier copy of this logic
+// on the /users/me/ route still discarded the identity fields and wrote a
+// mock storage key, reintroducing nester#1190 and nester#1191.
+func (h *UserHandler) submitKYCFor(w http.ResponseWriter, r *http.Request, userID uuid.UUID) {
+
 	if h.kycStore == nil {
 		// Storage is not ready in this environment — reject the upload
 		// rather than accept and discard it (nester#1191's explicit
@@ -388,57 +398,21 @@ func (h *UserHandler) getKYCStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // submitKYCMe submits KYC data for the authenticated user (no user ID param needed).
+// submitKYCMe submits KYC for the authenticated user.
+//
+// Delegates to submitKYCFor rather than repeating the parsing and storage
+// logic. The copy that used to live here discarded full_name, date_of_birth
+// and country with `_ =`, and built its storage key by concatenating the
+// client-supplied filename onto "s3://mock-bucket/" — reintroducing both
+// nester#1190 and nester#1191 on a second route after they were fixed on the
+// first.
 func (h *UserHandler) submitKYCMe(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.authenticatedUserID(w, r)
 	if !ok {
 		return
 	}
 
-	// Reuse the same submitKYC logic
-	r.Body = http.MaxBytesReader(w, r.Body, maxKYCUploadBytes)
-	if err := r.ParseMultipartForm(kycInMemoryBytes); err != nil {
-		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("could not parse multipart form"))
-		return
-	}
-
-	fullName := r.FormValue("full_name")
-	dateOfBirth := r.FormValue("date_of_birth")
-	country := r.FormValue("country")
-	idType := r.FormValue("id_type")
-	idNumber := r.FormValue("id_number")
-
-	if idType == "" || idNumber == "" {
-		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("id_type and id_number are required"))
-		return
-	}
-
-	idFrontFile, idFrontHeader, err := r.FormFile("id_front")
-	if err != nil {
-		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("id_front is required"))
-		return
-	}
-	defer idFrontFile.Close()
-
-	frontKey := "s3://mock-bucket/" + idFrontHeader.Filename
-
-	var backKey *string
-	idBackFile, idBackHeader, err := r.FormFile("id_back")
-	if err == nil {
-		defer idBackFile.Close()
-		bk := "s3://mock-bucket/" + idBackHeader.Filename
-		backKey = &bk
-	}
-
-	_ = fullName
-	_ = dateOfBirth
-	_ = country
-
-	if err := h.service.SubmitKYC(r.Context(), userID, idType, idNumber, frontKey, backKey); err != nil {
-		h.writeDomainError(w, r, err)
-		return
-	}
-
-	response.WriteJSON(w, http.StatusAccepted, response.OK(map[string]string{"status": "pending"}))
+	h.submitKYCFor(w, r, userID)
 }
 
 // getKYCStatusMe retrieves KYC status for the authenticated user.
