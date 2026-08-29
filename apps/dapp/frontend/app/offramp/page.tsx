@@ -407,7 +407,12 @@ export default function OfframpPage() {
           type: "bank_transfer",
           provider: "bank",
           account_number: data.accountNumber,
-          account_name: resolvedName || data.accountName,
+          // The form has no accountName field — the schema is amount,
+          // accountNumber and bankCode. The account name is resolved from
+          // the bank lookup, so `|| data.accountName` referenced something
+          // that does not exist and failed the type check. resolvedName is
+          // null until the lookup succeeds; the server validates the field.
+          account_name: resolvedName ?? "",
           bank_code: data.bankCode,
         };
       }
