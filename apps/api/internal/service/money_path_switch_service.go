@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -80,9 +81,15 @@ func (s *MoneyPathSwitchService) EnsureAllowed(ctx context.Context, op moneypath
 
 	state, err := s.get(ctx, op)
 	if err != nil {
+		// Fail closed, but do not lose why. The handler maps ErrPaused to a
+		// 503 before it reaches any logging branch, so without this line an
+		// outage looks exactly like a deliberate pause to whoever is on call.
+		slog.Default().ErrorContext(ctx, "money path switch unreadable; refusing operation",
+			"operation", string(op), "error", err.Error())
 		return &moneypath.PausedError{
 			Operation: op,
 			Reason:    "pause state is currently unreadable; refusing the operation until it can be confirmed",
+			Cause:     err,
 		}
 	}
 	if state.Paused {

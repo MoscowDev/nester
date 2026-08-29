@@ -6,6 +6,7 @@ import { Check, ExternalLink, Loader2, X } from "lucide-react";
 import { useWallet } from "@/components/wallet-provider";
 import { usePortfolio } from "@/components/portfolio-provider";
 import { useNetwork } from "@/hooks/useNetwork";
+import { readWalletIsTestnet } from "@/lib/stellar/wallet-network";
 import {
   STEP_ORDER,
   type OnboardingSignals,
@@ -66,7 +67,33 @@ export function TestnetSetupStepper() {
   }, []);
 
   const walletAvailable = walletsLoaded && wallets.some((w) => w.isAvailable);
-  const onTestnet = currentNetwork?.id ? currentNetwork.id === "testnet" : null;
+
+  // The wallet's real network, not the app's own preference. currentNetwork
+  // comes from localStorage and says which network the user asked the app to
+  // use — it says nothing about what the extension is pointed at, and the two
+  // disagree exactly when this step matters. Reading the preference here
+  // marked a mainnet user complete and walked them into a Friendbot call that
+  // cannot work.
+  //
+  // null means unproven (no wallet, or a wallet that does not expose
+  // getNetwork); completedSteps treats that as not-yet-done unless the
+  // account turns out to be funded.
+  const [onTestnet, setOnTestnet] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!isConnected || !address) {
+      setOnTestnet(null);
+      return;
+    }
+    void readWalletIsTestnet().then((v) => {
+      if (!cancelled) setOnTestnet(v);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isConnected, address]);
+
   const funded = fundedViaFriendbot || (balances?.XLM ?? 0) > 0;
   const hasDeposit = (positions?.length ?? 0) > 0;
 

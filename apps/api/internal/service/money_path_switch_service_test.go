@@ -278,3 +278,51 @@ func TestNilServiceAllowsEverything(t *testing.T) {
 		t.Fatalf("nil service should allow: %v", err)
 	}
 }
+
+// Failing closed is right; losing the cause is not. The handler maps
+// ErrPaused to a 503 before reaching any logging branch, so if the underlying
+// error is discarded an outage is indistinguishable from a deliberate pause —
+// the operator sees a reason nobody set and nothing names the real fault.
+func TestUnreadableSwitchPreservesTheUnderlyingCause(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemorySwitchRepo()
+	dbDown := errors.New("database unreachable")
+	repo.failGet = dbDown
+	svc := NewMoneyPathSwitchService(repo, nil)
+
+	err := svc.EnsureAllowed(ctx, moneypath.OperationDeposit)
+
+	if !errors.Is(err, moneypath.ErrPaused) {
+		t.Fatalf("must still fail closed: got %v", err)
+	}
+	if !errors.Is(err, dbDown) {
+		t.Fatalf("the underlying cause must survive for the logs: got %v", err)
+	}
+
+	var paused *moneypath.PausedError
+	if !errors.As(err, &paused) {
+		t.Fatalf("expected *moneypath.PausedError, got %T", err)
+	}
+	if paused.Cause == nil {
+		t.Fatal("PausedError.Cause must be set when the switch could not be read")
+	}
+}
+
+// A genuine operator pause carries no Cause, so the two are distinguishable
+// by more than the reason string.
+func TestDeliberatePauseCarriesNoCause(t *testing.T) {
+	ctx := context.Background()
+	svc := NewMoneyPathSwitchService(newMemorySwitchRepo(), nil)
+
+	if _, err := svc.SetPaused(ctx, moneypath.OperationDeposit, true, "incident", nil, ""); err != nil {
+		t.Fatalf("engage: %v", err)
+	}
+
+	var paused *moneypath.PausedError
+	if !errors.As(svc.EnsureAllowed(ctx, moneypath.OperationDeposit), &paused) {
+		t.Fatal("expected a *moneypath.PausedError")
+	}
+	if paused.Cause != nil {
+		t.Fatalf("a deliberate pause must not carry a cause, got %v", paused.Cause)
+	}
+}

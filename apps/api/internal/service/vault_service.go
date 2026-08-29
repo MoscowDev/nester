@@ -1101,6 +1101,18 @@ func (s *VaultService) EmergencyWithdraw(ctx context.Context, input EmergencyWit
 }
 
 func (s *VaultService) RebalancePosition(ctx context.Context, input RebalancePositionInput) (RebalancePositionResult, error) {
+	// Global pause (#1120). A rebalance moves funds between protocols and
+	// reaches the chain, so an engaged switch has to stop it too — gating
+	// only deposits and withdrawals left this path open while the money
+	// path was supposed to be halted. Bound to the withdrawal switch
+	// because that is the side the funds leave from.
+	//
+	// EmergencyWithdraw is deliberately left ungated: blocking the
+	// emergency exit during an incident is backwards.
+	if err := s.ensureMoneyPathAllowed(ctx, moneypath.OperationWithdrawal); err != nil {
+		return RebalancePositionResult{}, err
+	}
+
 	if input.VaultID == uuid.Nil || input.UserID == uuid.Nil {
 		return RebalancePositionResult{}, vault.ErrInvalidVault
 	}

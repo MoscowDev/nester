@@ -60,6 +60,12 @@ type Switch struct {
 type PausedError struct {
 	Operation Operation
 	Reason    string
+	// Cause is set when the refusal came from being unable to read the
+	// switch rather than from an operator engaging it. Without it, a
+	// database outage is indistinguishable from a deliberate pause: the
+	// caller sees "paused" with a reason nobody set, and the real fault
+	// never reaches the logs.
+	Cause error
 }
 
 func (e *PausedError) Error() string {
@@ -70,5 +76,12 @@ func (e *PausedError) Error() string {
 }
 
 // Unwrap lets errors.Is(err, ErrPaused) match a *PausedError, so call sites
-// can test for the condition without caring about the reason.
-func (e *PausedError) Unwrap() error { return ErrPaused }
+// can test for the condition without caring about the reason. When the
+// refusal came from an unreadable switch, the underlying cause is returned
+// alongside it so errors.Is finds that too.
+func (e *PausedError) Unwrap() []error {
+	if e.Cause != nil {
+		return []error{ErrPaused, e.Cause}
+	}
+	return []error{ErrPaused}
+}
