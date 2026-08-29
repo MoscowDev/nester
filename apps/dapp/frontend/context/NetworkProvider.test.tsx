@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { safeStorage } from "@/lib/storage";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { NetworkProvider, useNetwork } from "./NetworkProvider";
 import { readNetworkId } from "@/lib/storageKeys";
@@ -22,6 +24,13 @@ function TestConsumer() {
 describe("NetworkProvider (#1233)", () => {
   beforeEach(() => {
     window.localStorage.clear();
+    // safeStorage's in-memory fallback is module state and survives between
+    // tests, so a test that forces a write to fall back (the quota case
+    // below) leaves nester_network_id behind. The next test then starts on
+    // mainnet, its "switch to mainnet" is a no-op, and the cache purge it
+    // asserts on never runs. Clearing with an empty prefix drains both the
+    // fallback map and localStorage.
+    safeStorage.removeByPrefix("");
   });
 
   afterEach(() => {
