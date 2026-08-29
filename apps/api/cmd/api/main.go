@@ -787,6 +787,7 @@ func run() error {
 		startedAt:    startedAt,
 		environment:  cfg.Environment(),
 		buildVersion: version,
+		breakers:     chainBreakers.readers(),
 	}
 	// Left nil when Redis is unconfigured, so readiness does not fail an
 	// instance that is deliberately running on the in-memory fallbacks.
@@ -1939,6 +1940,15 @@ type healthDeps struct {
 	startedAt    time.Time
 	environment  string
 	buildVersion string
+
+	// breakers is keyed by upstream; nil entries mean that dependency is not
+	// guarded. The probes below deliberately do NOT go through these clients:
+	// a health check is a diagnostic, and an open breaker must not be able to
+	// report the upstream as unreachable when it has in fact recovered. The
+	// probe result and the breaker state are two independent facts, and seeing
+	// "reachable, but breaker still open" is exactly what tells an operator
+	// recovery is one probe away.
+	breakers map[metrics.Upstream]*breaker.Breaker
 }
 
 // registerHealthRoutes wires the liveness, readiness, and diagnostic health
@@ -2136,10 +2146,17 @@ func detailedHealthHandler(deps healthDeps) http.HandlerFunc {
 			GeneratedAt: time.Now().UTC(),
 		}
 
-		dbCtx, dbCancel := context.WithTimeout(r.Context(), deps.probeTimeout)
+		// A nil pingDB means "no database wired into this handler" rather than
+		// "the database is healthy": report it as unavailable instead of
+		// dereferencing nil, so a misconfigured build fails the probe loudly
+		// rather than serving a 200 that claims a database it never checked.
 		dbStart := time.Now()
-		dbErr := deps.pingDB(dbCtx)
-		dbCancel()
+		dbErr := errors.New("database probe unavailable")
+		if deps.pingDB != nil {
+			dbCtx, dbCancel := context.WithTimeout(r.Context(), deps.probeTimeout)
+			dbErr = deps.pingDB(dbCtx)
+			dbCancel()
+		}
 		var stat poolStats
 		if deps.poolStats != nil {
 			stat = deps.poolStats()
@@ -2170,27 +2187,38 @@ func detailedHealthHandler(deps healthDeps) http.HandlerFunc {
 		hStart := time.Now()
 		hRes := stellarpkg.PingHorizon(r.Context(), deps.httpClient, deps.horizonURL)
 		resp.Horizon = dependencyStatus{
-			OK:            hRes.OK,
-			Endpoint:      hRes.Endpoint,
-			Error:         safeProbeError(hRes),
-			LatencyMillis: time.Since(hStart).Milliseconds(),
-			LatestLedger:  hRes.LatestLedger,
+			OK:             hRes.OK,
+			Endpoint:       hRes.Endpoint,
+			Error:          safeProbeError(hRes),
+			LatencyMillis:  time.Since(hStart).Milliseconds(),
+			LatestLedger:   hRes.LatestLedger,
+			CircuitBreaker: newBreakerStatus(deps.breakers[metrics.UpstreamHorizon]),
 		}
 
 		rStart := time.Now()
 		rRes := stellarpkg.PingSorobanRPC(r.Context(), deps.httpClient, deps.rpcURL)
 		resp.SorobanRPC = dependencyStatus{
-			OK:            rRes.OK,
-			Endpoint:      rRes.Endpoint,
-			Error:         safeProbeError(rRes),
-			LatencyMillis: time.Since(rStart).Milliseconds(),
-			LatestLedger:  rRes.LatestLedger,
+			OK:             rRes.OK,
+			Endpoint:       rRes.Endpoint,
+			Error:          safeProbeError(rRes),
+			LatencyMillis:  time.Since(rStart).Milliseconds(),
+			LatestLedger:   rRes.LatestLedger,
+			CircuitBreaker: newBreakerStatus(deps.breakers[metrics.UpstreamSorobanRPC]),
 		}
 
 		// Redis only counts against this instance when it is configured; the
 		// in-memory fallback path has nothing to lose.
 		redisDown := resp.Redis.Configured && !resp.Redis.OK
-		degraded := !resp.Database.OK || redisDown || !resp.Horizon.OK || !resp.SorobanRPC.OK
+		// An open breaker is "degraded" even when the probe alongside it
+		// succeeded, because callers are still being shed until the next probe
+		// closes it. It does not affect the HTTP status: chain dependencies
+		// have never gated readiness here, and making an open breaker return
+		// 503 would evict the pod from its load balancer over an upstream
+		// outage — turning the partial failure into the total one this feature
+		// exists to prevent. Only the database, Redis, and draining do that.
+		degraded := !resp.Database.OK || redisDown || !resp.Horizon.OK || !resp.SorobanRPC.OK ||
+			breakerDegraded(resp.Horizon.CircuitBreaker) ||
+			breakerDegraded(resp.SorobanRPC.CircuitBreaker)
 		draining := !deps.ready.Load()
 		switch {
 		case draining:

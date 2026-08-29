@@ -75,7 +75,11 @@ func TestNoNewUnboundedListLimits(t *testing.T) {
 			return nil
 		}
 
+		// ToSlash so the allowlist keys below (written with forward slashes)
+		// match on Windows too, where filepath.Rel returns backslashes and
+		// every entry would otherwise miss and report as a fresh violation.
 		rel, _ := filepath.Rel(root, path)
+		rel = filepath.ToSlash(rel)
 
 		ast.Inspect(file, func(n ast.Node) bool {
 			kv, ok := n.(*ast.KeyValueExpr)
