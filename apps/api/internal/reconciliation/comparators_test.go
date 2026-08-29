@@ -48,9 +48,15 @@ func (f *fakeVaultLister) ListVaults(_ context.Context, filter vault.ListFilter)
 // test set, i.e. no finding.
 type fakeChainReader struct {
 	balances map[string]decimal.Decimal
+	// errFor makes reads for these addresses fail, simulating an
+	// uninitialized contract or an i128 past the reader's int64 range.
+	errFor map[string]error
 }
 
 func (f *fakeChainReader) TotalAssets(_ context.Context, contractAddress string) (decimal.Decimal, error) {
+	if err, ok := f.errFor[contractAddress]; ok {
+		return decimal.Zero, err
+	}
 	if bal, ok := f.balances[contractAddress]; ok {
 		return bal, nil
 	}

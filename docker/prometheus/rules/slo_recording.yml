@@ -662,6 +662,15 @@ groups:
       - record: reconcile:health:failed_run_rate5m
         expr: sum(rate(nester_reconcile_runs_total{outcome="failed"}[5m]))
 
+      # Balance-reconciler liveness (nester#1082). The age gauge above belongs
+      # to the transaction poller and is reset every 15 seconds by its passes,
+      # so a dead vault-balance reconciler would hide behind it forever. The
+      # balance job publishes its own scrape-time age series — emitted only by
+      # the replica actually doing the work — recorded here for the same
+      # dashboard/pager symmetry as the rest of the group.
+      - record: reconcile:balance:last_run_age_seconds
+        expr: max(nester_reconcile_balance_last_run_age_seconds)
+
       # Pending submissions. Depth alone is ambiguous — a large queue that
       # drains is healthy — so the age of the oldest entry is the series the
       # alert is written against.
