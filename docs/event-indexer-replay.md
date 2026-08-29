@@ -194,7 +194,7 @@ handed, dropping those events.
 Dead code that looks like a safety mechanism is worse than an absent one,
 because an auditor reading `ledger_checkpoints` in the schema concludes reorgs
 are handled. So `reorg_indexer.go` and its test are deleted, and migration
-`105_drop_unused_reorg_checkpoints` drops the empty `ledger_checkpoints` table
+`108_drop_unused_reorg_checkpoints` drops the empty `ledger_checkpoints` table
 and the unused `idx_processed_events_dedup` index. The vestigial
 `processed_events.tx_hash` / `event_index` columns are left in place; nothing
 reads or writes them.
