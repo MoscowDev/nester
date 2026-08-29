@@ -145,13 +145,13 @@ make dev
 
 This builds and starts PostgreSQL, the Go API, the Next.js frontend, and the FastAPI intelligence service. On first run Docker pulls base images and compiles everything — expect 2–5 minutes.
 
-| Service      | URL                          |
-| ------------ | ---------------------------- |
-| Frontend     | http://localhost:3001        |
-| API          | http://localhost:8080        |
-| API health   | http://localhost:8080/health |
-| Intelligence | http://localhost:8000        |
-| PostgreSQL   | localhost:5432               |
+| Service      | URL                           |
+| ------------ | ----------------------------- |
+| Frontend     | http://localhost:3001         |
+| API          | http://localhost:8080         |
+| API health   | http://localhost:8080/healthz |
+| Intelligence | http://localhost:8000         |
+| PostgreSQL   | localhost:5432                |
 
 The database is seeded automatically with a test user, two vaults, allocations, and settlements in various states.
 
@@ -178,6 +178,30 @@ docker compose exec postgres psql -U nester nester_dev
 ```
 
 Test credentials: user `550e8400-e29b-41d4-a716-446655440001` / `testuser@nester.dev`.
+
+### Health endpoints
+
+**`/healthz` is the canonical liveness endpoint.** Point orchestrator liveness
+probes, load-balancer checks, and uptime monitors at it. `/health` is a
+permanent alias — same handler, same response — kept for the probes and
+runbooks that already reference it; neither path will be removed.
+
+| Path | Purpose | Healthy | Unhealthy |
+|------|---------|---------|-----------|
+| `GET /healthz` | Liveness (canonical). Reflects the drain flag only, never dependency state, so a database outage never gets the process restarted. | `200` `ok` | `503` `draining` |
+| `GET /health` | Permanent alias for `/healthz`. | `200` `ok` | `503` `draining` |
+| `GET /readyz` | Readiness. Fails closed on PostgreSQL and — when `REDIS_ADDR` is set — Redis, which backs the token-revocation cache and the distributed rate limiters. | `200` `ok` | `503` `draining` \| `database unavailable` \| `redis unavailable` |
+| `GET /health/detailed` | JSON diagnostics: per-dependency status for PostgreSQL (with pool counters), Redis, Horizon, and Soroban RPC. `503` when draining, or when PostgreSQL or a configured Redis is down; `200` with `"status":"degraded"` when only Horizon or Soroban RPC is down. | `200` | `503` |
+
+All four are unauthenticated, so dependency failures are reported as coarse
+reasons (`unavailable`, `timeout`) rather than driver errors — a pgx or
+go-redis error carries connection details that must not be published. The full
+error stays in the service logs.
+
+Liveness and readiness are exempt from rate limiting and cost quotas so an
+orchestrator can always reach them. The internal metrics listener serves its
+own `GET /healthz` on `METRICS_ADDR`, so "the scrape target is down" reads
+differently from "the API is down".
 
 ---
 

@@ -70,7 +70,12 @@ services:
       - ./apps/api:/app
       - go_mod_cache:/go/pkg/mod
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      # /healthz is the canonical liveness path (see README "Health
+      # endpoints"); /health remains a permanent alias for it. Liveness rather
+      # than /readyz on purpose: the services that wait on `service_healthy`
+      # need the process to be up, and readiness additionally fails on
+      # dependency outages this check should not restart the container for.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5

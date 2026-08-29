@@ -776,14 +776,11 @@ func run() error {
 
 	depHTTPClient := &http.Client{Timeout: cfg.Startup().DependencyTimeout()}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", livenessHandler(&ready))
-	mux.HandleFunc("GET /healthz", livenessHandler(&ready))
-	mux.HandleFunc("GET /readyz", readinessHandler(&ready, pgPool, cfg.Database().ConnectionTimeout()))
-	mux.HandleFunc("GET /health/detailed", detailedHealthHandler(detailedHealthDeps{
+	healthDependencies := healthDeps{
 		ready:        &ready,
-		pgPool:       pgPool,
-		dbTimeout:    cfg.Database().ConnectionTimeout(),
+		pingDB:       pgPool.Ping,
+		poolStats:    pgxPoolStats(pgPool),
+		probeTimeout: cfg.Database().ConnectionTimeout(),
 		httpClient:   depHTTPClient,
 		horizonURL:   cfg.Stellar().HorizonURL(),
 		rpcURL:       cfg.Stellar().RPCURL(),
@@ -791,7 +788,17 @@ func run() error {
 		environment:  cfg.Environment(),
 		buildVersion: version,
 		breakers:     chainBreakers.readers(),
-	}))
+	}
+	// Left nil when Redis is unconfigured, so readiness does not fail an
+	// instance that is deliberately running on the in-memory fallbacks.
+	if redisClient != nil {
+		healthDependencies.pingRedis = func(ctx context.Context) error {
+			return redisClient.Ping(ctx).Err()
+		}
+	}
+
+	mux := http.NewServeMux()
+	registerHealthRoutes(mux, healthDependencies)
 	yieldHarvestHandler := handler.NewYieldHarvestHandler(yieldHarvestService)
 	yieldHarvestHandler.Register(mux)
 
@@ -1896,30 +1903,37 @@ func livenessHandler(ready *atomic.Bool) http.HandlerFunc {
 	}
 }
 
-func readinessHandler(ready *atomic.Bool, db *repository.PostgresDB, timeout time.Duration) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		if !ready.Load() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte("draining"))
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), timeout)
-		defer cancel()
-		if err := db.Ping(ctx); err != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte("database unavailable"))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	}
+// healthProbe reports whether one dependency is reachable, returning nil when
+// it is.
+//
+// The health handlers take probes rather than concrete clients so the endpoint
+// contract can be exercised deterministically: a stub standing in for a
+// stopped PostgreSQL or Redis is enough, and no test has to actually stop one.
+type healthProbe func(ctx context.Context) error
+
+// poolStats is the subset of pgxpool.Stat that /health/detailed reports. Taken
+// as a snapshot function for the same reason as healthProbe: the handler never
+// needs a live pool, only the numbers.
+type poolStats struct {
+	MaxConns      int32
+	AcquiredConns int32
+	IdleConns     int32
+	TotalConns    int32
 }
 
-type detailedHealthDeps struct {
-	ready        *atomic.Bool
-	pgPool       *repository.PostgresDB
-	dbTimeout    time.Duration
+// healthDeps is everything the four health endpoints need.
+type healthDeps struct {
+	ready  *atomic.Bool
+	pingDB healthProbe
+	// pingRedis is nil when REDIS_ADDR is unset and the in-memory fallbacks
+	// are in use (see the redisClient construction in run): readiness then has
+	// no Redis to be blocked on.
+	pingRedis healthProbe
+	// poolStats may be nil, in which case /health/detailed reports zeroed pool
+	// counters rather than panicking.
+	poolStats    func() poolStats
+	probeTimeout time.Duration
+
 	httpClient   *http.Client
 	horizonURL   string
 	rpcURL       string
@@ -1935,6 +1949,81 @@ type detailedHealthDeps struct {
 	// "reachable, but breaker still open" is exactly what tells an operator
 	// recovery is one probe away.
 	breakers map[metrics.Upstream]*breaker.Breaker
+}
+
+// registerHealthRoutes wires the liveness, readiness, and diagnostic health
+// endpoints onto mux.
+//
+// /healthz is the canonical liveness path (#1042). It is the sibling of
+// /readyz, and the path the internal metrics listener already serves on its
+// own port (metrics.NewServer), so the whole fleet answers liveness at one
+// name. /health is a permanent alias — it is what the compose healthcheck, the
+// staging smoke tests, and the deployed probes were pointed at, and both paths
+// are the same handler, so they cannot drift apart.
+//
+// Routing lives in one function, called by run and by the contract test, so a
+// route that moves in production cannot leave the test asserting the old one.
+func registerHealthRoutes(mux *http.ServeMux, deps healthDeps) {
+	mux.HandleFunc("GET /healthz", livenessHandler(deps.ready))
+	mux.HandleFunc("GET /health", livenessHandler(deps.ready))
+	mux.HandleFunc("GET /readyz", readinessHandler(deps))
+	mux.HandleFunc("GET /health/detailed", detailedHealthHandler(deps))
+}
+
+// readinessHandler reports whether this instance should be sent traffic.
+//
+// It fails closed on every dependency the instance cannot serve correct
+// responses without: PostgreSQL, and — when configured — Redis, which backs
+// the token-revocation cache and the distributed rate limiters, so an instance
+// that has lost it would honour revoked sessions and under-count limits. A
+// pool that is saturated rather than down surfaces identically: the ping
+// blocks waiting for a free connection and probeTimeout turns that into a
+// failure.
+func readinessHandler(deps healthDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if !deps.ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("draining"))
+			return
+		}
+		dbCtx, dbCancel := context.WithTimeout(r.Context(), deps.probeTimeout)
+		dbErr := deps.pingDB(dbCtx)
+		dbCancel()
+		if dbErr != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("database unavailable"))
+			return
+		}
+		// Each probe gets its own budget. Sharing one deadline would let a
+		// slow-but-healthy database consume it and report Redis as down.
+		if deps.pingRedis != nil {
+			redisCtx, redisCancel := context.WithTimeout(r.Context(), deps.probeTimeout)
+			redisErr := deps.pingRedis(redisCtx)
+			redisCancel()
+			if redisErr != nil {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("redis unavailable"))
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}
+}
+
+// pgxPoolStats adapts the live pgxpool statistics to the snapshot
+// /health/detailed reports.
+func pgxPoolStats(db *repository.PostgresDB) func() poolStats {
+	return func() poolStats {
+		stat := db.Pool.Stat()
+		return poolStats{
+			MaxConns:      stat.MaxConns(),
+			AcquiredConns: stat.AcquiredConns(),
+			IdleConns:     stat.IdleConns(),
+			TotalConns:    stat.TotalConns(),
+		}
+	}
 }
 
 type dependencyStatus struct {
@@ -1995,18 +2084,59 @@ type dbStatus struct {
 	TotalConns    int32  `json:"total_conns"`
 }
 
+// redisStatus is reported separately from dependencyStatus because Redis is
+// optional: an instance with REDIS_ADDR unset runs on in-memory fallbacks and
+// is healthy, which "ok" alone cannot distinguish from a Redis that answered.
+type redisStatus struct {
+	OK            bool   `json:"ok"`
+	Configured    bool   `json:"configured"`
+	LatencyMillis int64  `json:"latency_ms,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
 type detailedHealthResponse struct {
 	Status      string           `json:"status"`
 	Environment string           `json:"environment"`
 	Version     string           `json:"version"`
 	UptimeSecs  int64            `json:"uptime_seconds"`
 	Database    dbStatus         `json:"database"`
+	Redis       redisStatus      `json:"redis"`
 	Horizon     dependencyStatus `json:"horizon"`
 	SorobanRPC  dependencyStatus `json:"soroban_rpc"`
 	GeneratedAt time.Time        `json:"generated_at"`
 }
 
-func detailedHealthHandler(deps detailedHealthDeps) http.HandlerFunc {
+// safeDependencyError reduces a dependency failure to a coarse reason that
+// reveals nothing about how this service reaches that dependency.
+//
+// /health/detailed is unauthenticated (see middleware.ProductionAuthRules), and
+// driver errors are not fit to publish: a pgx dial failure carries the DSN's
+// user, host, and database name; a go-redis failure carries the resolved
+// address; an upstream HTTP probe echoes back up to 512 bytes of the remote
+// body. The operator reads the real error in the logs — the public payload
+// says only whether the dependency answered, and whether it ran out of time.
+func safeDependencyError(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return "timeout"
+	default:
+		return "unavailable"
+	}
+}
+
+// safeProbeError is safeDependencyError for the Stellar probes, which report
+// failure as a pre-formatted string rather than an error. That string can
+// contain the upstream's own response body, so none of it is echoed.
+func safeProbeError(res stellarpkg.HealthResult) string {
+	if res.OK {
+		return ""
+	}
+	return "unavailable"
+}
+
+func detailedHealthHandler(deps healthDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		resp := detailedHealthResponse{
 			Status:      "ok",
@@ -2016,27 +2146,42 @@ func detailedHealthHandler(deps detailedHealthDeps) http.HandlerFunc {
 			GeneratedAt: time.Now().UTC(),
 		}
 
-		// A health endpoint is what you call when things are already broken,
-		// so it must not panic on a dependency it was handed as nil.
-		if deps.pgPool != nil {
-			dbCtx, dbCancel := context.WithTimeout(r.Context(), deps.dbTimeout)
-			dbStart := time.Now()
-			dbErr := deps.pgPool.Ping(dbCtx)
+		// A nil pingDB means "no database wired into this handler" rather than
+		// "the database is healthy": report it as unavailable instead of
+		// dereferencing nil, so a misconfigured build fails the probe loudly
+		// rather than serving a 200 that claims a database it never checked.
+		dbStart := time.Now()
+		dbErr := errors.New("database probe unavailable")
+		if deps.pingDB != nil {
+			dbCtx, dbCancel := context.WithTimeout(r.Context(), deps.probeTimeout)
+			dbErr = deps.pingDB(dbCtx)
 			dbCancel()
-			stat := deps.pgPool.Pool.Stat()
-			resp.Database = dbStatus{
-				OK:            dbErr == nil,
-				LatencyMillis: time.Since(dbStart).Milliseconds(),
-				MaxConns:      stat.MaxConns(),
-				AcquiredConns: stat.AcquiredConns(),
-				IdleConns:     stat.IdleConns(),
-				TotalConns:    stat.TotalConns(),
-			}
-			if dbErr != nil {
-				resp.Database.Error = dbErr.Error()
-			}
-		} else {
-			resp.Database = dbStatus{Error: "database pool is not configured"}
+		}
+		var stat poolStats
+		if deps.poolStats != nil {
+			stat = deps.poolStats()
+		}
+		resp.Database = dbStatus{
+			OK:            dbErr == nil,
+			LatencyMillis: time.Since(dbStart).Milliseconds(),
+			Error:         safeDependencyError(dbErr),
+			MaxConns:      stat.MaxConns,
+			AcquiredConns: stat.AcquiredConns,
+			IdleConns:     stat.IdleConns,
+			TotalConns:    stat.TotalConns,
+		}
+
+		// An unconfigured Redis is a supported single-instance mode, not a
+		// fault: report it as healthy but unconfigured rather than probing nil.
+		resp.Redis = redisStatus{OK: true, Configured: deps.pingRedis != nil}
+		if deps.pingRedis != nil {
+			redisCtx, redisCancel := context.WithTimeout(r.Context(), deps.probeTimeout)
+			redisStart := time.Now()
+			redisErr := deps.pingRedis(redisCtx)
+			redisCancel()
+			resp.Redis.OK = redisErr == nil
+			resp.Redis.LatencyMillis = time.Since(redisStart).Milliseconds()
+			resp.Redis.Error = safeDependencyError(redisErr)
 		}
 
 		hStart := time.Now()
@@ -2044,7 +2189,7 @@ func detailedHealthHandler(deps detailedHealthDeps) http.HandlerFunc {
 		resp.Horizon = dependencyStatus{
 			OK:             hRes.OK,
 			Endpoint:       hRes.Endpoint,
-			Error:          hRes.Error,
+			Error:          safeProbeError(hRes),
 			LatencyMillis:  time.Since(hStart).Milliseconds(),
 			LatestLedger:   hRes.LatestLedger,
 			CircuitBreaker: newBreakerStatus(deps.breakers[metrics.UpstreamHorizon]),
@@ -2055,20 +2200,23 @@ func detailedHealthHandler(deps detailedHealthDeps) http.HandlerFunc {
 		resp.SorobanRPC = dependencyStatus{
 			OK:             rRes.OK,
 			Endpoint:       rRes.Endpoint,
-			Error:          rRes.Error,
+			Error:          safeProbeError(rRes),
 			LatencyMillis:  time.Since(rStart).Milliseconds(),
 			LatestLedger:   rRes.LatestLedger,
 			CircuitBreaker: newBreakerStatus(deps.breakers[metrics.UpstreamSorobanRPC]),
 		}
 
-		// An open breaker is a degraded dependency even when the probe above
+		// Redis only counts against this instance when it is configured; the
+		// in-memory fallback path has nothing to lose.
+		redisDown := resp.Redis.Configured && !resp.Redis.OK
+		// An open breaker is "degraded" even when the probe alongside it
 		// succeeded, because callers are still being shed until the next probe
 		// closes it. It does not affect the HTTP status: chain dependencies
 		// have never gated readiness here, and making an open breaker return
 		// 503 would evict the pod from its load balancer over an upstream
 		// outage — turning the partial failure into the total one this feature
-		// exists to prevent. Only the database and draining do that.
-		degraded := !resp.Database.OK || !resp.Horizon.OK || !resp.SorobanRPC.OK ||
+		// exists to prevent. Only the database, Redis, and draining do that.
+		degraded := !resp.Database.OK || redisDown || !resp.Horizon.OK || !resp.SorobanRPC.OK ||
 			breakerDegraded(resp.Horizon.CircuitBreaker) ||
 			breakerDegraded(resp.SorobanRPC.CircuitBreaker)
 		draining := !deps.ready.Load()
@@ -2079,8 +2227,12 @@ func detailedHealthHandler(deps detailedHealthDeps) http.HandlerFunc {
 			resp.Status = "degraded"
 		}
 
+		// The 503 set matches /readyz: Postgres and (when configured) Redis are
+		// the dependencies this instance cannot serve correct responses without.
+		// Horizon and Soroban RPC degrade individual routes, so they report
+		// "degraded" at 200 rather than pulling the instance out of rotation.
 		status := http.StatusOK
-		if draining || !resp.Database.OK {
+		if draining || !resp.Database.OK || redisDown {
 			status = http.StatusServiceUnavailable
 		}
 
