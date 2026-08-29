@@ -417,13 +417,28 @@ jobs:
 
           report = Path("pip-audit-report.json")
           findings = json.loads(report.read_text() or "[]")
-          # pip-audit JSON format: list of vulnerabilities with id, description, etc.
-          # No severity or cvss in the JSON; pip-audit only provides vulnerability records
+          # pip-audit --format json emits {"dependencies": [{"name":..,
+          # "vulns": [...]}, ...]}, not a flat list of vulnerabilities. Reading
+          # it as a list made len() count the dict's *keys* — reporting "Found
+          # 2 Python vulnerabilities" on a clean scan — and then iterating it
+          # yielded strings, so .get() raised AttributeError and failed the
+          # job unconditionally. Older pip-audit versions did return a list,
+          # so both shapes are accepted.
+          dependencies = findings.get("dependencies", []) if isinstance(findings, dict) else findings
 
-          if findings:
-              print(f"::error::Found {len(findings)} Python vulnerabilities")
-              for vuln in findings:
-                  print(f"  {vuln.get('vulnerability_id', 'unknown')}: {vuln.get('description', '')[:120]}")
+          vulns = []
+          for dep in dependencies:
+              if not isinstance(dep, dict):
+                  continue
+              for vuln in dep.get("vulns", []):
+                  vulns.append((dep.get("name", "unknown"), vuln))
+
+          if vulns:
+              print(f"::error::Found {len(vulns)} Python vulnerabilities")
+              for name, vuln in vulns:
+                  vid = vuln.get("id", "unknown")
+                  desc = str(vuln.get("description", ""))[:120]
+                  print(f"  {name} {vid}: {desc}")
               raise SystemExit(1)
 
           print("✓ No Python vulnerabilities detected")
