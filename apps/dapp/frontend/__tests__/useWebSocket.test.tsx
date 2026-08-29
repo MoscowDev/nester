@@ -280,6 +280,7 @@ describe("useWebSocket wire protocol", () => {
         expect(unsubs).toHaveLength(1);
         expect(unsubs[0].channels).toEqual(["vaults:global"]);
     });
+});
 
 // ---------------------------------------------------------------------------
 // State transitions
