@@ -117,11 +117,15 @@ type ProjectionOutput struct {
 // MonthlyContribution (zero/empty when there is none), and ContributionSource
 // says where that came from — mirroring SimulationOutput.ContributionSource.
 type ProjectionAssumptions struct {
-	RecurringAmount    decimal.Decimal `json:"recurring_amount"`
-	Cadence            string          `json:"cadence,omitempty"` // "weekly" | "biweekly" | "monthly" | ""
-	ProjectedAPY       float64         `json:"projected_apy"`
-	TimelineMonths     int             `json:"timeline_months"`
-	ContributionSource string          `json:"contribution_source"` // "schedule" | "single_deposit"
+	RecurringAmount decimal.Decimal `json:"recurring_amount"`
+	Cadence         string          `json:"cadence,omitempty"` // "weekly" | "biweekly" | "monthly" | ""
+	ProjectedAPY    float64         `json:"projected_apy"`
+	TimelineMonths  int             `json:"timeline_months"`
+	// ContributionSource is "schedule" when the amount came from the vault's
+	// linked savings goal's active schedule, "caller_supplied" when the caller
+	// passed a MonthlyContribution straight to the generic compound endpoint,
+	// and "single_deposit" when there is no recurring contribution at all.
+	ContributionSource string `json:"contribution_source"`
 }
 
 // ProjectionSummary provides aggregate statistics about the projection
