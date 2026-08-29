@@ -96,6 +96,17 @@ interface WebSocketProviderProps {
    * the re-subscribe-on-reconnect behaviour would be untestable.
    */
   channelsOverride?: string[];
+  /**
+   * Token to authenticate the socket with instead of the stored session one.
+   *
+   * Only the E2E harness passes this, for the same reason as
+   * channelsOverride. The real token is minted by a wallet signature, and
+   * AuthProvider clears the stored session whenever no wallet is connected,
+   * so a browser-driven test cannot hold one: the socket would be refused
+   * for want of a credential and every reconnection assertion would observe
+   * "offline" rather than the behaviour under test.
+   */
+  tokenOverride?: string;
   /** Heartbeat ping interval in ms. Harness-only; see channelsOverride. */
   heartbeatInterval?: number;
   /** Pong grace period in ms. Harness-only; see channelsOverride. */
@@ -105,6 +116,7 @@ interface WebSocketProviderProps {
 export function WebSocketProvider({
   children,
   channelsOverride,
+  tokenOverride,
   heartbeatInterval,
   heartbeatTimeout,
 }: WebSocketProviderProps) {
@@ -116,7 +128,10 @@ export function WebSocketProvider({
   // Get current token from token store. Real session token, not a forged one.
   // Pass a token getter function to useWebSocket so it always uses the current token
   // before each connection attempt (not just at render time).
-  const getToken = useCallback(() => getAccessToken(), []);
+  const getToken = useCallback(
+    () => tokenOverride ?? getAccessToken(),
+    [tokenOverride],
+  );
 
   const walletChannels = useMemo<string[]>(() => {
     if (!address) return [];

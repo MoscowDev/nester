@@ -10,7 +10,17 @@ import { test, expect, type Page, type WebSocketRoute } from '@playwright/test';
  * user can actually see.
  */
 
-const WS_URL = 'ws://localhost:3001/ws';
+/**
+ * Match the harness socket regardless of its query string.
+ *
+ * The client authenticates during the upgrade by appending `?token=…` (the
+ * browser WebSocket API cannot set headers), so the URL is not a fixed
+ * string. An exact-match pattern silently stops intercepting the moment a
+ * token is present: the route never fires, the page talks to a `/ws` that
+ * nothing is serving, and every assertion here reports "offline" instead of
+ * the reconnection behaviour under test.
+ */
+const WS_URL = /^ws:\/\/localhost:3001\/ws(\?.*)?$/;
 const HARNESS = '/e2e/connection';
 
 interface FakeHub {
