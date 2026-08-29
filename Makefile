@@ -1,4 +1,4 @@
-.PHONY: fmt fmt-check clippy build test test-short integration-test clean dev dev-down dev-reset dev-logs dev-db go-test go-test-short
+.PHONY: fmt fmt-check clippy build test test-short integration-test clean dev dev-external dev-down dev-reset dev-logs dev-db go-test go-test-short
 
 CARGO := cargo
 CONTRACTS_DIR := packages/contracts

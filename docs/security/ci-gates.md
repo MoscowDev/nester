@@ -80,7 +80,7 @@ cargo audit
 
 **Threshold:** High and critical vulnerabilities (CVSS ≥ 7.0).
 
-**Moderate vulnerabilities** are warned but do not block the build, allowing time for upstream releases.
+**Moderate vulnerabilities** (4.0 ≤ CVSS < 7.0) are warned but do not block the build, allowing time for upstream releases.
 
 **How it works:**
 
@@ -248,10 +248,10 @@ Each gate has been verified to fail CI when a violation is introduced. Below are
 
 ```go
 // BAD: CI fails
-apiKey := "sk-live-abc123"
+apiKey := "<test-key-placeholder>"
 
 // GOOD: CI passes
-apiKey := "sk-live-abc123" // #nosec G101 -- test credential only
+apiKey := "<test-key-placeholder>" // #nosec G101 -- test credential only
 ```
 
 ### Rust (cargo-audit)
@@ -274,7 +274,7 @@ apiKey := "sk-live-abc123" // #nosec G101 -- test credential only
 
 **Example:** A transitive dependency introduces a critical vulnerability → `pnpm audit --audit-level=critical` finds it → CI fails.
 
-**Note:** Moderate and high are reported but do not block (tracked in #1025).
+**Moderate vulnerabilities** (4.0 ≤ CVSS < 7.0) are reported but do not block (tracked in #1025).
 
 ### JavaScript (eslint + security)
 

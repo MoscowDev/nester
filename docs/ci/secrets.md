@@ -34,11 +34,11 @@ This document lists every secret required or consumed by GitHub Actions workflow
 2. Generate an API token at https://semgrep.dev/manage/settings/tokens
 3. Add to GitHub repository settings as `SEMGREP_APP_TOKEN`
 
-**Failure mode:** **Optional with silent degradation.** Semgrep SAST still runs locally without the token, but:
+**Failure mode:** **Optional with explicit warning.** Semgrep SAST still runs locally without the token, but:
 
 - Cannot sync rules from Semgrep Cloud (uses bundled rules only)
 - Findings are not uploaded to Semgrep dashboard
-- Build still passes; no signal that the token is missing
+- Build emits a `::warning::` when the token is missing
 
 **Impact if missing:** False sense of security — TypeScript/Next.js scanning runs but with incomplete ruleset. Production-ready code may have vulnerabilities the cloud rules would catch.
 
@@ -182,7 +182,7 @@ Skipping Slack notification (SLACK_DEPLOYMENT_WEBHOOK not set)
 
 Workflow continues; deployment still succeeds but notification is not sent.
 
-**Security:** Webhook URL grants access only to post in the target channel, not to read or modify workspace data. Acceptable to share within the team.
+**Security:** Webhook URL grants access only to post in the target channel, not to read or modify workspace data. Treat this secret as sensitive: share only through approved secret-management channels (not email, chat, or public documentation). Do not commit to the repository.
 
 **Rotation:** Recommended annually or if exposed. Generate a new webhook in Slack and update GitHub Secrets.
 

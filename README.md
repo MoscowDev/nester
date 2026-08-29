@@ -192,7 +192,7 @@ By default, `make dev` binds all services to `127.0.0.1` (loopback) only. This m
 - **API** on `127.0.0.1:8080` — accessible only from your machine
 - **Frontend** on `127.0.0.1:3001` — accessible only from your machine
 
-This prevents accidental network exposure when developing on shared WiFi (airports, cafés, offices). A misconfigured dev setup cannot leak credentials or data to the network.
+This prevents accidental network exposure when developing on shared WiFi (airports, cafés, offices). Loopback binding reduces accidental remote exposure of development credentials and services.
 
 ### Development Credentials
 

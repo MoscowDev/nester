@@ -54,12 +54,22 @@ jobs:
         id: guard
         env:
           API_BASE_URL: ${{ secrets.STAGING_PROBE_API_BASE_URL }}
+          INTELLIGENCE_BASE_URL: ${{ secrets.STAGING_PROBE_INTELLIGENCE_BASE_URL }}
+          AUTH_TOKEN: ${{ secrets.STAGING_PROBE_AUTH_TOKEN }}
+          INTELLIGENCE_TOKEN: ${{ secrets.STAGING_PROBE_INTELLIGENCE_TOKEN }}
+          VAULT_ID: ${{ secrets.STAGING_PROBE_VAULT_ID }}
         run: |
-          if [ -z "$API_BASE_URL" ]; then
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::STAGING_PROBE_API_BASE_URL is not set — skipping the probe run."
-          else
+          all_set=true
+          for var in API_BASE_URL INTELLIGENCE_BASE_URL AUTH_TOKEN INTELLIGENCE_TOKEN VAULT_ID; do
+            if [ -z "$(eval echo \$$var)" ]; then
+              echo "::notice::STAGING_PROBE_${var} is not set — skipping the probe run."
+              all_set=false
+            fi
+          done
+          if [ "$all_set" = "true" ]; then
             echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Run synthetic probes

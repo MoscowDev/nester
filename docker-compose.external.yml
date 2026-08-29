@@ -21,42 +21,46 @@
 
 services:
   redis:
-    ports:
-      - "6379:6379"
+    ports: !override
+      - "0.0.0.0:6379:6379"
 
   postgres:
-    ports:
-      - "5432:5432"
+    ports: !override
+      - "0.0.0.0:5432:5432"
 
   api:
-    ports:
-      - "8080:8080"
+    ports: !override
+      - "0.0.0.0:8080:8080"
 
   frontend:
-    ports:
-      - "3001:3001"
+    ports: !override
+      - "0.0.0.0:3001:3001"
+    environment: !override
+      NEXT_PUBLIC_API_URL: "http://${EXTERNAL_HOSTNAME:-localhost}:8080"
+      NEXT_PUBLIC_WS_URL: "ws://${EXTERNAL_HOSTNAME:-localhost}:8080"
+      ALLOWED_ORIGINS: "${EXTERNAL_HOSTNAME:-localhost}"
 
   intelligence:
-    ports:
-      - "8000:8000"
+    ports: !override
+      - "0.0.0.0:8000:8000"
 
   jaeger:
-    ports:
-      - "16686:16686"
+    ports: !override
+      - "0.0.0.0:16686:16686"
 
   otel-collector:
-    ports:
-      - "4317:4317"
-      - "4318:4318"
+    ports: !override
+      - "0.0.0.0:4317:4317"
+      - "0.0.0.0:4318:4318"
 
   prometheus:
-    ports:
-      - "9091:9090"
+    ports: !override
+      - "0.0.0.0:9091:9090"
 
   alertmanager:
-    ports:
-      - "9093:9093"
+    ports: !override
+      - "0.0.0.0:9093:9093"
 
   grafana:
-    ports:
-      - "3002:3000"
+    ports: !override
+      - "0.0.0.0:3002:3000"

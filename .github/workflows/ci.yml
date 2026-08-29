@@ -397,26 +397,16 @@ jobs:
 
           report = Path("pip-audit-report.json")
           findings = json.loads(report.read_text() or "[]")
-          dependencies = findings.get("dependencies", []) if isinstance(findings, dict) else findings
-          vulns = []
+          # pip-audit JSON format: list of vulnerabilities with id, description, etc.
+          # No severity or cvss in the JSON; pip-audit only provides vulnerability records
 
-          for dep in dependencies:
-              for vuln in dep.get("vulns", []):
-                  severity = str(vuln.get("severity", "")).lower()
-                  cvss = vuln.get("cvss")
-                  if severity in {"high", "critical"}:
-                      vulns.append(vuln)
-                      continue
-                  if isinstance(cvss, (int, float)) and cvss >= 7.0:
-                      vulns.append(vuln)
-
-          if vulns:
-              print(f"::error::Found {len(vulns)} high/critical Python vulnerabilities")
-              for vuln in vulns:
-                  print(f"  {vuln.get('id', 'unknown')}: {vuln.get('description', '')[:120]}")
+          if findings:
+              print(f"::error::Found {len(findings)} Python vulnerabilities")
+              for vuln in findings:
+                  print(f"  {vuln.get('vulnerability_id', 'unknown')}: {vuln.get('description', '')[:120]}")
               raise SystemExit(1)
 
-          print("✓ No high/critical Python vulnerabilities detected")
+          print("✓ No Python vulnerabilities detected")
           PY
         working-directory: apps/intelligence
 
@@ -427,13 +417,18 @@ jobs:
 
       - name: Semgrep SAST (TypeScript/Next.js)
         if: needs.changes.outputs.dapp == 'true' || needs.changes.outputs.shared == 'true'
-        uses: semgrep/semgrep-action@v1
+        uses: semgrep/semgrep-action@d47f5d7e1aebe6cf25526f14e5fdf0d5e3c36a82
         with:
           config: >-
             p/typescript
             p/react
             p/nextjs
             p/secrets
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Check Semgrep cloud token status
+        if: needs.changes.outputs.dapp == 'true' || needs.changes.outputs.shared == 'true'
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
         run: |
