@@ -388,11 +388,16 @@ export default function OfframpPage() {
     try {
       // Build destination from payoutMode
       let destination: any;
+      let bankAccountID: string | undefined;
       if (payoutMode.type === "saved") {
+        // SavedBankAccount deliberately carries only account_last4 — the API
+        // never returns a full account number to the client, so one cannot be
+        // sent back. POST /settlements accepts bank_account_id for exactly
+        // this case and resolves the account server-side.
+        bankAccountID = payoutMode.account.id;
         destination = {
           type: "bank_transfer",
           provider: "bank",
-          account_number: payoutMode.account.account_number,
           account_name: payoutMode.account.account_name,
           bank_code: payoutMode.account.bank_code,
         };
@@ -420,6 +425,7 @@ export default function OfframpPage() {
           fiat_amount: displayReceive.toString(),
           exchange_rate: receiveCurrency.rate.toString(),
           destination,
+          ...(bankAccountID ? { bank_account_id: bankAccountID } : {}),
         }),
       });
 
@@ -430,7 +436,7 @@ export default function OfframpPage() {
           title: "Withdrawal Submitted",
           message: `Withdrew ${numericAmount.toLocaleString("en-US", {
             maximumFractionDigits: 2,
-          })} ${sendAsset.symbol} to ${accountInfo?.bank_name ?? effectiveBankCode} ending in ${destination.account_number.slice(-4)}.`,
+          })} ${sendAsset.symbol} to ${accountInfo?.bank_name ?? effectiveBankCode} ending in ${payoutMode.type === "saved" ? payoutMode.account.account_last4 : String(destination.account_number ?? "").slice(-4)}.`,
           // TODO: Add explorer link once settlement returns on-chain transaction hash
           actionLabel: "View Transaction",
         },
