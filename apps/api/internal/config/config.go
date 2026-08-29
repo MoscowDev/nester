@@ -55,6 +55,7 @@ type Config struct {
 	bankAccountCipherKey  string
 	accountCipher         AccountCipherConfig
 	transactionPoller     TransactionPollerConfig
+	reconciliation        ReconciliationConfig
 	recurringDeposit      RecurringDepositConfig
 	jobQueue              JobQueueConfig
 	harvest               HarvestConfig
@@ -172,6 +173,16 @@ type TransactionPollerConfig struct {
 	enabled  bool
 	interval time.Duration
 	minAge   time.Duration
+}
+
+// ReconciliationConfig governs the scheduled vault-balance reconciliation job
+// (nester#1082, see internal/reconciliation.Runner): it reads authoritative
+// balances from the vault contract and compares them to the database,
+// recording — never correcting — any divergence.
+type ReconciliationConfig struct {
+	enabled  bool
+	interval time.Duration
+	dryRun   bool
 }
 
 // StartupConfig governs one-shot work performed before the server begins
@@ -419,6 +430,12 @@ func Load() (*Config, error) {
 			enabled:  loader.boolDefault("TX_POLLER_ENABLED", true),
 			interval: loader.durationDefault("TX_POLLER_INTERVAL", 15*time.Second),
 			minAge:   loader.durationDefault("TX_POLLER_MIN_AGE", 30*time.Second),
+		},
+		reconciliation: ReconciliationConfig{
+			enabled: loader.boolDefault("RECONCILE_ENABLED", true),
+			// Default matches reconciliation.DefaultCadenceConfig().Balance.
+			interval: loader.durationDefault("RECONCILE_INTERVAL", 5*time.Minute),
+			dryRun:   loader.boolDefault("RECONCILE_DRY_RUN", false),
 		},
 		recurringDeposit: RecurringDepositConfig{
 			enabled:    loader.boolDefault("RECURRING_DEPOSIT_ENABLED", true),
@@ -739,6 +756,22 @@ func (c Config) AccountCipher() AccountCipherConfig {
 
 func (c Config) TransactionPoller() TransactionPollerConfig {
 	return c.transactionPoller
+}
+
+func (c Config) Reconciliation() ReconciliationConfig {
+	return c.reconciliation
+}
+
+func (r ReconciliationConfig) Enabled() bool {
+	return r.enabled
+}
+
+func (r ReconciliationConfig) Interval() time.Duration {
+	return r.interval
+}
+
+func (r ReconciliationConfig) DryRun() bool {
+	return r.dryRun
 }
 
 func (t TransactionPollerConfig) Enabled() bool {

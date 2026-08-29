@@ -2,6 +2,8 @@ package reconciliation
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,6 +26,11 @@ type BalanceComparator struct {
 	Chain      VaultBalanceReader
 	Classifier Classifier
 	Clock      func() time.Time
+	// Logger records per-vault chain-read failures (nil falls back to
+	// slog.Default). Those are logged and skipped rather than failing the
+	// run — see Reconcile — so the log line is the only trace of a vault
+	// that could not be compared.
+	Logger *slog.Logger
 }
 
 func (c BalanceComparator) Name() string { return "vault_balance" }
@@ -40,11 +47,26 @@ const vaultReconcilePageSize = 500
 
 func (c BalanceComparator) Reconcile(ctx context.Context, scope Scope) (ComparisonResult, error) {
 	now := clock(c.Clock)
+	logger := c.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 
 	var findings []Finding
 	classifier := NewClassifier(c.Classifier)
 	checked := 0
 	offset := 0
+	// Per-vault chain-read failures are logged and skipped rather than
+	// failing the run (nester#1082): contract addresses are caller-supplied
+	// at vault creation, so a single unreadable contract — uninitialized,
+	// malformed, or holding an i128 balance past the reader's int64 range —
+	// must not become a standing denial of the whole safety net, dropping
+	// every finding already collected each pass. The false-clean trap is
+	// guarded below: if every attempted read failed the run still fails,
+	// so an RPC outage or open circuit breaker cannot read as "all clear".
+	readFailures := 0
+	firstReadErr := error(nil)
+	attemptedReads := 0
 	for {
 		filter := vault.ListFilter{Status: string(vault.StatusActive), Limit: vaultReconcilePageSize, Offset: offset}
 		vaults, total, err := c.Vaults.ListVaults(ctx, filter)
@@ -59,14 +81,31 @@ func (c BalanceComparator) Reconcile(ctx context.Context, scope Scope) (Comparis
 			if scope.VaultID != uuid.Nil && v.ID != scope.VaultID {
 				continue
 			}
-			checked++
 			if v.ContractAddress == "" {
+				checked++
 				continue
 			}
+			attemptedReads++
 			onChain, err := c.Chain.TotalAssets(ctx, v.ContractAddress)
 			if err != nil {
-				return ComparisonResult{Checked: checked}, err
+				// Shutdown is not a per-vault condition: propagate so the
+				// engine records the aborted run instead of a sweep that
+				// skips every remaining vault and completes.
+				if ctx.Err() != nil {
+					return ComparisonResult{Checked: checked}, err
+				}
+				readFailures++
+				if firstReadErr == nil {
+					firstReadErr = err
+				}
+				logger.Warn("reconciliation: chain read failed; vault skipped this pass",
+					"vault_id", v.ID.String(),
+					"contract_address", v.ContractAddress,
+					"error", err,
+				)
+				continue
 			}
+			checked++
 			if !v.CurrentBalance.Equal(onChain) {
 				recorded := v.CurrentBalance
 				chain := onChain
@@ -92,6 +131,24 @@ func (c BalanceComparator) Reconcile(ctx context.Context, scope Scope) (Comparis
 		if offset >= total || len(vaults) == 0 {
 			break
 		}
+	}
+
+	// Every attempted read failing is not a set of per-vault problems — it is
+	// the chain-read path being down (RPC outage, open breaker, bad config).
+	// Completing the run would report zero divergences because nothing was
+	// compared, the exact false-clean reading this system must never produce.
+	if attemptedReads > 0 && readFailures == attemptedReads {
+		return ComparisonResult{Checked: checked},
+			fmt.Errorf("all %d chain reads failed; first error: %w", readFailures, firstReadErr)
+	}
+	if readFailures > 0 {
+		// checked_count on the run row reflects only vaults actually
+		// compared (or empty-address rows with nothing to compare), so a
+		// partial sweep is visible as checked < active vault count.
+		logger.Warn("reconciliation: pass completed with partial coverage",
+			"checked", checked,
+			"read_failures", readFailures,
+		)
 	}
 
 	return ComparisonResult{Checked: checked, Findings: findings}, nil

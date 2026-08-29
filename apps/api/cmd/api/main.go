@@ -38,6 +38,7 @@ import (
 	"github.com/suncrestlabs/nester/apps/api/internal/notifications"
 	"github.com/suncrestlabs/nester/apps/api/internal/objectstorage"
 	"github.com/suncrestlabs/nester/apps/api/internal/oracle"
+	"github.com/suncrestlabs/nester/apps/api/internal/reconciliation"
 	"github.com/suncrestlabs/nester/apps/api/internal/repository"
 	"github.com/suncrestlabs/nester/apps/api/internal/repository/postgres"
 	"github.com/suncrestlabs/nester/apps/api/internal/retry"
@@ -1532,6 +1533,58 @@ func run() error {
 		submissionReconciler.SetLeaderChecker(schedulerLeadership)
 		go submissionReconciler.Run(shutdownCtx)
 	}
+
+	// Vault-balance reconciliation (nester#1082). The scheduled safety net for
+	// the money path: reads the authoritative balance from each vault contract
+	// and compares it against vaults.current_balance, recording — never
+	// correcting — any divergence to the reconciliation audit tables, the log,
+	// and the divergence metric the ReconciliationDivergence alert pages on.
+	//
+	// The comparison happens in RAW STROOPS, the unit the event indexer stores
+	// (docs/event-indexer-replay.md; migration 103) — see
+	// stellarpkg.ContractReader.TotalAssetsStroops for why rescaling either
+	// side would hide bookkeeping errors.
+	//
+	// Like the submission reconciler above it needs no key material, runs on
+	// the shared leader gate so one instance sweeps, and stops the moment
+	// shutdown begins. RECONCILE_DRY_RUN rehearses a pass against production
+	// data without writing or alerting anything.
+	balanceReconciler := reconciliation.NewRunner(
+		reconciliation.RunnerConfig{
+			Enabled:  cfg.Reconciliation().Enabled(),
+			Interval: cfg.Reconciliation().Interval(),
+			DryRun:   cfg.Reconciliation().DryRun(),
+		},
+		reconciliation.NewPostgresRepository(db),
+		[]reconciliation.Comparator{
+			reconciliation.BalanceComparator{
+				Vaults: vaultRepository,
+				Chain:  stellarpkg.StroopsBalanceReader{Reader: contractReader},
+				// Severity thresholds are stroop-denominated because the
+				// comparison is: warn on any nonzero disagreement (with exact
+				// integer bookkeeping there is no acceptable dust), escalate
+				// to critical at 1 USDC (1e7 stroops). The dust tolerance is
+				// sub-integer so no whole-stroop difference can be waved off.
+				Classifier: reconciliation.Classifier{
+					DustTolerance:     decimal.RequireFromString("0.5"),
+					WarningThreshold:  decimal.NewFromInt(1),
+					CriticalThreshold: decimal.NewFromInt(10_000_000),
+				},
+				Logger: baseLogger.WithGroup("balance-reconciler"),
+			},
+		},
+		reconciliation.NewLogAlerter(baseLogger.WithGroup("balance-reconciler")),
+		baseLogger.WithGroup("balance-reconciler"),
+	)
+	balanceReconciler.SetLeaderChecker(schedulerLeadership)
+	balanceReconciler.SetMetrics(appMetrics)
+	// Liveness is a scrape-time series (freshness-collector pattern): a dead
+	// reconciler's age keeps climbing on the clock, and a non-leader replica
+	// emits nothing rather than a misleading idle age.
+	if err := appMetrics.RegisterBalanceReconcileAge(balanceReconciler.AgeSample); err != nil {
+		baseLogger.Error("failed to register balance reconcile age collector", "error", err)
+	}
+	go balanceReconciler.Run(shutdownCtx)
 
 	// Balance-freshness SLI (nester#1056, nester#1088): the indexer samples
 	// its own position against the network tip on every tick and publishes it

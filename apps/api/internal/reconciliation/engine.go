@@ -123,7 +123,13 @@ func (e *Engine) runComparator(ctx context.Context, comparator Comparator, scope
 		}
 	}
 
-	if err := e.repo.CompleteRun(ctx, run.ID, stats); err != nil {
+	// Bookkeeping writes survive cancellation (nester#1082): a SIGTERM
+	// mid-pass cancels the comparator's context, and issuing the final
+	// status write on that same context would strand the run row in
+	// status 'running' forever — indistinguishable from a killed process.
+	// The database pool outlives the signal during graceful drain, so the
+	// detached write almost always lands.
+	if err := e.repo.CompleteRun(context.WithoutCancel(ctx), run.ID, stats); err != nil {
 		return stats, fmt.Errorf("reconciliation: complete run: %w", err)
 	}
 	return stats, nil
@@ -136,7 +142,11 @@ func (e *Engine) runComparator(ctx context.Context, comparator Comparator, scope
 // from one that was simply killed, and runErr is lost. Logging it here means
 // the cause survives even when the write does not (nester#1194).
 func (e *Engine) recordFailedRun(ctx context.Context, runID uuid.UUID, runErr error) {
-	if failErr := e.repo.FailRun(ctx, runID, runErr.Error()); failErr != nil {
+	// Detached from cancellation for the same reason as CompleteRun: when the
+	// failure IS the cancellation (shutdown mid-pass), writing the failure on
+	// the cancelled context would itself fail and strand the run row in
+	// status 'running' (nester#1082).
+	if failErr := e.repo.FailRun(context.WithoutCancel(ctx), runID, runErr.Error()); failErr != nil {
 		e.logger.Error("reconciliation: failed to record run failure",
 			"run_id", runID,
 			"original_error", runErr,
