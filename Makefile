@@ -32,9 +32,20 @@ clean:
 	cd $(CONTRACTS_DIR) && $(CARGO) clean
 
 # Docker Compose — local development
+#
+# By default, all services bind to 127.0.0.1 (loopback only) for security.
+# This prevents accidental exposure on shared networks.
+#
+# For multi-machine setups or mobile testing, opt in to external binding:
+#   make dev-external
+#
+# See docker-compose.external.yml and docs/security/dev-setup.md.
 
 dev: ## Start all services with Docker Compose (migrations auto-apply)
 	docker compose up --build
+
+dev-external: ## Start all services with external binding (0.0.0.0) — use only on trusted networks
+	docker compose -f docker-compose.yml -f docker-compose.external.yml up --build
 
 dev-down: ## Stop all services
 	docker compose down

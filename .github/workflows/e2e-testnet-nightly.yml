@@ -70,7 +70,15 @@ jobs:
           VAULT_ID: ${{ vars.VAULT_ID }}
           STAGING_URL: ${{ inputs.staging_url || vars.STAGING_URL }}
           CI: "true"
-        run: pnpm test:e2e:testnet
+        run: |
+          if [ -z "$TESTNET_WALLET_ADDRESS" ]; then
+            echo "::error::TESTNET_WALLET_ADDRESS is not configured. This secret is required for testnet E2E tests."
+            echo "Set it in GitHub repository settings: Settings → Secrets and variables → Actions → TESTNET_WALLET_ADDRESS"
+            echo "See docs/ci/secrets.md for details."
+            exit 1
+          fi
+
+          pnpm test:e2e:testnet
 
       # Uploaded on failure only: the trace and screenshots are what identify
       # which step of the journey broke, per the issue's acceptance criteria.

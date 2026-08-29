@@ -1,0 +1,62 @@
+# docker-compose.external.yml — Opt-in external binding override
+#
+# By default, docker-compose.yml binds all services to 127.0.0.1 (loopback only).
+# This keeps the dev stack secure on shared networks: a developer running `make dev`
+# in a café cannot inadvertently expose Postgres or Redis with known credentials.
+#
+# To expose services on all network interfaces (0.0.0.0), compose this file on top:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.external.yml up
+#
+# This is useful for:
+#   - Multi-machine setups where the API runs in a container accessed from another host
+#   - Mobile app testing against a dev backend
+#   - CI/CD pipelines that need network access from outside the container
+#
+# SECURITY WARNING: Binding to 0.0.0.0 exposes services to your network with
+# development credentials (postgres:nester_dev_password, redis with no auth).
+# Only use this on trusted networks. Never on public WiFi.
+#
+# See docs/security/dev-setup.md for more.
+
+services:
+  redis:
+    ports:
+      - "6379:6379"
+
+  postgres:
+    ports:
+      - "5432:5432"
+
+  api:
+    ports:
+      - "8080:8080"
+
+  frontend:
+    ports:
+      - "3001:3001"
+
+  intelligence:
+    ports:
+      - "8000:8000"
+
+  jaeger:
+    ports:
+      - "16686:16686"
+
+  otel-collector:
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+
+  prometheus:
+    ports:
+      - "9091:9090"
+
+  alertmanager:
+    ports:
+      - "9093:9093"
+
+  grafana:
+    ports:
+      - "3002:3000"
