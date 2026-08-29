@@ -450,7 +450,10 @@ export default function OfframpPage() {
     } catch (error) {
       addNotification(
         {
-          type: "error",
+          // "error" is not a NotificationType. offramp_status is the member
+          // for an off-ramp outcome, and this is the failure end of the same
+          // flow whose success path above uses withdrawal_processed.
+          type: "offramp_status",
           title: "Withdrawal Failed",
           message:
             error instanceof Error
