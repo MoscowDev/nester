@@ -58,6 +58,8 @@ func (h *UserHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/users/wallet/{address}", h.getUserByWallet)
 	mux.HandleFunc("POST /api/v1/users/kyc/{id}", h.submitKYC)
 	mux.HandleFunc("GET /api/v1/users/kyc/{id}", h.getKYCStatus)
+	mux.HandleFunc("POST /api/v1/users/me/kyc", h.submitKYCMe)
+	mux.HandleFunc("GET /api/v1/users/me/kyc", h.getKYCStatusMe)
 	mux.HandleFunc("GET /api/v1/users/profile", h.getProfile)
 	mux.HandleFunc("PATCH /api/v1/users/profile", h.updateProfile)
 	mux.HandleFunc("GET /api/v1/user-vaults/{id}", h.listUserVaultsForIntelligence)
@@ -246,6 +248,16 @@ func (h *UserHandler) submitKYC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.submitKYCFor(w, r, userID)
+}
+
+// submitKYCFor runs the KYC submission for an already-resolved user id.
+// Shared by submitKYC (id from the path) and submitKYCMe (id from the
+// session) so the two routes cannot drift — an earlier copy of this logic
+// on the /users/me/ route still discarded the identity fields and wrote a
+// mock storage key, reintroducing nester#1190 and nester#1191.
+func (h *UserHandler) submitKYCFor(w http.ResponseWriter, r *http.Request, userID uuid.UUID) {
+
 	if h.kycStore == nil {
 		// Storage is not ready in this environment — reject the upload
 		// rather than accept and discard it (nester#1191's explicit
@@ -360,6 +372,53 @@ func (h *UserHandler) getKYCStatus(w http.ResponseWriter, r *http.Request) {
 	userID, err := uuid.Parse(idStr)
 	if err != nil {
 		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("invalid user ID"))
+		return
+	}
+
+	model, err := h.service.GetUser(r.Context(), userID)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	resp := map[string]any{
+		"status": model.KYCStatus,
+	}
+	if model.KYCSubmittedAt != nil {
+		resp["submitted_at"] = model.KYCSubmittedAt
+	}
+	if model.KYCReviewedAt != nil {
+		resp["reviewed_at"] = model.KYCReviewedAt
+	}
+	if model.KYCRejectionReason != nil {
+		resp["rejection_reason"] = model.KYCRejectionReason
+	}
+
+	response.WriteJSON(w, http.StatusOK, response.OK(resp))
+}
+
+// submitKYCMe submits KYC data for the authenticated user (no user ID param needed).
+// submitKYCMe submits KYC for the authenticated user.
+//
+// Delegates to submitKYCFor rather than repeating the parsing and storage
+// logic. The copy that used to live here discarded full_name, date_of_birth
+// and country with `_ =`, and built its storage key by concatenating the
+// client-supplied filename onto "s3://mock-bucket/" — reintroducing both
+// nester#1190 and nester#1191 on a second route after they were fixed on the
+// first.
+func (h *UserHandler) submitKYCMe(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.authenticatedUserID(w, r)
+	if !ok {
+		return
+	}
+
+	h.submitKYCFor(w, r, userID)
+}
+
+// getKYCStatusMe retrieves KYC status for the authenticated user.
+func (h *UserHandler) getKYCStatusMe(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.authenticatedUserID(w, r)
+	if !ok {
 		return
 	}
 

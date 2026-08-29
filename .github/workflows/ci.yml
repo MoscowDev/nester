@@ -572,6 +572,12 @@ jobs:
           TEST_DATABASE_DSN: postgres://nester:nester@localhost:5432/nester_test?sslmode=disable
         run: go test -race -timeout 900s -count=1 -p 1 ./...
 
+      - name: Test (property-based vault arithmetic)
+        env:
+          RAPID_CHECKS: "32"
+          RAPID_SEED: "29062026"
+        run: go test -timeout 60s -run PropertyBased -v ./internal/domain/vault
+
   contracts:
     name: Contracts (Rust)
     needs: changes
