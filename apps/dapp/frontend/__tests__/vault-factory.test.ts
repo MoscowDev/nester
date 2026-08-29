@@ -62,8 +62,12 @@ describe("VaultFactory.createVault", () => {
     });
 
     it("rejects non-string description", async () => {
+      // name must be valid, otherwise validateWizardData rejects on the
+      // name check first and never reaches the description branch this test
+      // is asserting on — INITIAL_WIZARD_DATA leaves name empty.
       const malformedData = {
         ...INITIAL_WIZARD_DATA,
+        name: "Test Vault",
         description: 123,
       } as unknown as WizardVaultData;
 
@@ -200,7 +204,9 @@ describe("VaultFactory.createVault", () => {
       );
 
       // Should pass validation (trimmed) but fail on missing contract config
-      expect(result.error).toContain("factory");
+      // Case-insensitive: the error names the env var in upper case
+      // (NEXT_PUBLIC_VAULT_FACTORY_CONTRACT_ID).
+      expect(result.error?.toLowerCase()).toContain("factory");
       expect(result.error).not.toContain("name");
     });
   });
