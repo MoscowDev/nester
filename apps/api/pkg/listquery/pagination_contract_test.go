@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -54,6 +55,7 @@ func TestNoNewUnboundedListLimits(t *testing.T) {
 
 	fset := token.NewFileSet()
 	violations := []string{}
+	matchedKnown := map[string]bool{}
 
 	err := filepath.WalkDir(internalDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -94,7 +96,11 @@ func TestNoNewUnboundedListLimits(t *testing.T) {
 			if !ok || lit.Kind != token.INT {
 				return true
 			}
-			value, convErr := strconv.Atoi(lit.Value)
+			// ParseInt with base 0, not Atoi: a token.INT literal may be
+			// written 1_000, 0x2710 or 0o1750, and Atoi rejects all three.
+			// Because the error branch skips rather than reports, those
+			// forms would slip past the guard entirely.
+			value, convErr := strconv.ParseInt(lit.Value, 0, 64)
 			if convErr != nil || value < 500 {
 				return true
 			}
@@ -103,6 +109,8 @@ func TestNoNewUnboundedListLimits(t *testing.T) {
 			key2 := rel + ":" + strconv.Itoa(pos.Line)
 			if _, known := knownLargeLimits[key2]; !known {
 				violations = append(violations, key2+": "+key.Name+": "+lit.Value)
+			} else {
+				matchedKnown[key2] = true
 			}
 			return true
 		})
@@ -113,6 +121,7 @@ func TestNoNewUnboundedListLimits(t *testing.T) {
 	}
 
 	if len(violations) > 0 {
+		sort.Strings(violations)
 		t.Errorf(
 			"found %d list-limit literal(s) >= 500 not in the reviewed allowlist "+
 				"(pkg/listquery/pagination_contract_test.go's knownLargeLimits):\n  %s\n\n"+
@@ -128,13 +137,37 @@ func TestNoNewUnboundedListLimits(t *testing.T) {
 		)
 	}
 
-	// Sanity check on the test itself: if every known entry stops matching
-	// (e.g. because the underlying code moved and line numbers shifted),
-	// this test would pass vacuously without actually scanning anything
-	// meaningful. Fail loudly instead so the allowlist gets updated rather
-	// than silently going stale.
+	// Sanity check on the test itself. Checking only that the map is non-empty
+	// does not catch staleness: it is a map literal, so it is non-empty by
+	// construction even when every entry has drifted off its call site.
+	// Assert each entry still matches a real one instead.
+	//
+	// This is also what makes the file:line keying self-correcting. Inserting
+	// lines above an allowlisted literal moves it, and the guard then reports
+	// the moved literal as a violation AND its old key as stale — naming both
+	// halves, so the fix is to update the key rather than to guess at it. A
+	// content-keyed scheme would avoid that churn, but every candidate key
+	// (enclosing function, literal value) is ambiguous here: several entries
+	// are the same ListUserVaults call with the same value, so the key would
+	// stop identifying a unique site.
 	if len(knownLargeLimits) == 0 {
 		t.Fatal("knownLargeLimits is empty — this test would no longer verify anything")
+	}
+	stale := []string{}
+	for key := range knownLargeLimits {
+		if !matchedKnown[key] {
+			stale = append(stale, key)
+		}
+	}
+	if len(stale) > 0 {
+		sort.Strings(stale)
+		t.Errorf(
+			"%d knownLargeLimits entr(ies) no longer match a large list-limit literal:\n  %s\n\n"+
+				"The referenced code moved, changed, or was fixed. Update the allowlist to the "+
+				"current file:line (or drop the entry if the limit is gone) so this guard keeps "+
+				"covering what it claims to.",
+			len(stale), strings.Join(stale, "\n  "),
+		)
 	}
 }
 
