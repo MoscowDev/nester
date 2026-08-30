@@ -454,13 +454,13 @@ func TestAmountPathHasNoFloat64(t *testing.T) {
 // has already lost precision before the indexer saw it, so writing it would
 // store a wrong balance. Rejecting surfaces the problem instead.
 func TestExtractEventAmount_RejectsUnsafeFloat64(t *testing.T) {
-	if _, ok := extractEventAmount(indexedEvent{
+	if _, ok := extractEventAmountStroops(indexedEvent{
 		Data: map[string]any{"amount": float64(1e18)},
 	}); ok {
 		t.Fatal("a float64 amount above 2^53 was accepted; it has already lost precision (B-11)")
 	}
 
-	got, ok := extractEventAmount(indexedEvent{
+	got, ok := extractEventAmountStroops(indexedEvent{
 		Data: map[string]any{"amount": json.Number("1000000000000000000")},
 	})
 	if !ok {
