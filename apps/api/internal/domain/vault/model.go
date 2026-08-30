@@ -72,6 +72,10 @@ var (
 	// would have that victim's on-chain deposits credited to it as well
 	// (nester#1148).
 	ErrContractAddressRegistered = errors.New("a vault is already registered for this contract address")
+	// ErrInvalidSharePrice is returned when a vault's share price is zero or
+	// negative, which makes an asset/share conversion meaningless. It signals
+	// corrupted balances rather than bad user input.
+	ErrInvalidSharePrice = errors.New("vault share price is not positive")
 	ErrCapacityExceeded     = errors.New("deposit would exceed vault capacity limit")
 	// ErrUserCancelled is returned when a user declines the wallet signature
 	// or abandons an attempt before submission. It exists to keep that case
