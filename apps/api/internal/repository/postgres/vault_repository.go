@@ -1140,6 +1140,12 @@ func mapRepositoryError(err error) error {
 		if pgErr.Code == "23505" && strings.Contains(pgErr.ConstraintName, "transaction_hash") {
 			return vault.ErrDuplicateTransaction
 		}
+		// uq_vaults_contract_address_live (migration 104). Checked before the
+		// generic 23505 fallthrough so a duplicate registration is a clear
+		// client error rather than an opaque 500 (nester#1148).
+		if pgErr.Code == "23505" && strings.Contains(pgErr.ConstraintName, "vaults_contract_address") {
+			return vault.ErrContractAddressRegistered
+		}
 	}
 
 	return err
