@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -90,7 +89,6 @@ func (h *VaultHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/vaults/{id}/preview-deposit", h.previewDeposit)
 	mux.HandleFunc("GET /api/v1/vaults/{id}/preview-withdraw", h.previewWithdraw)
 	mux.HandleFunc("GET /api/v1/vaults", h.listUserVaults)
-	mux.HandleFunc("GET /api/v1/vaults/all", h.listVaults)
 	mux.HandleFunc("POST /api/v1/vaults/{id}/deposit", h.depositToVault)
 	mux.HandleFunc("POST /api/v1/vaults/{id}/withdraw", h.withdrawFromVault)
 	mux.HandleFunc("GET /api/v1/vaults/{id}/rebalance-suggestion", h.getRebalanceSuggestion)
@@ -185,52 +183,6 @@ func (h *VaultHandler) getVault(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response.WriteJSON(w, http.StatusOK, response.OK(model))
-}
-
-func (h *VaultHandler) listVaults(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-
-	limit := 20
-	if raw := q.Get("limit"); raw != "" {
-		v, err := strconv.Atoi(raw)
-		if err != nil || v < 1 {
-			response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("limit must be a positive integer"))
-			return
-		}
-		if v > 100 {
-			response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("limit must not exceed 100"))
-			return
-		}
-		limit = v
-	}
-
-	offset := 0
-	if raw := q.Get("offset"); raw != "" {
-		v, err := strconv.Atoi(raw)
-		if err != nil || v < 0 {
-			response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("offset must be a non-negative integer"))
-			return
-		}
-		offset = v
-	}
-
-	vaults, total, err := h.service.ListVaults(r.Context(), service.ListVaultsInput{
-		Limit:  limit,
-		Offset: offset,
-		Status: q.Get("status"),
-	})
-	if err != nil {
-		h.writeDomainError(w, r, err)
-		return
-	}
-
-	out := response.OK(vaults)
-	out.Meta = &response.Meta{
-		Page:       offset/limit + 1,
-		PerPage:    limit,
-		TotalCount: total,
-	}
-	response.WriteJSON(w, http.StatusOK, out)
 }
 
 func (h *VaultHandler) listUserVaults(w http.ResponseWriter, r *http.Request) {
@@ -956,10 +908,42 @@ func (h *VaultHandler) previewWithdraw(w http.ResponseWriter, r *http.Request) {
 	response.WriteJSON(w, http.StatusOK, response.OK(out))
 }
 
+// requireVaultOwner resolves a vault and confirms the authenticated caller owns
+// it. Callers get 404 rather than 403 on a vault owned by someone else, for the
+// same reason getVault does: a 403 distinguishes "exists but not yours" from
+// "does not exist", which turns the endpoint into an existence oracle for other
+// users' vault IDs (#1101, #1150).
+func (h *VaultHandler) requireVaultOwner(w http.ResponseWriter, r *http.Request, vaultID uuid.UUID) bool {
+	user, ok := auth.GetUserFromContext(r.Context())
+	if !ok {
+		response.WriteJSON(w, http.StatusUnauthorized, response.Err(http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized"))
+		return false
+	}
+
+	model, err := h.service.GetVault(r.Context(), vaultID)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return false
+	}
+
+	if model.UserID.String() != user.ID {
+		response.WriteJSON(w, http.StatusNotFound, response.NotFound("vault"))
+		return false
+	}
+
+	return true
+}
+
 func (h *VaultHandler) getSharePrice(w http.ResponseWriter, r *http.Request) {
 	vaultID, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
 		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("vault id must be a valid UUID"))
+		return
+	}
+
+	// The response carries total assets and total shares for this vault, so it
+	// is owner-only despite reading like a public quote.
+	if !h.requireVaultOwner(w, r, vaultID) {
 		return
 	}
 
@@ -976,6 +960,12 @@ func (h *VaultHandler) convert(w http.ResponseWriter, r *http.Request) {
 	vaultID, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
 		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr("vault id must be a valid UUID"))
+		return
+	}
+
+	// Conversion is evaluated at this vault's own share price, so the result
+	// discloses the same balance data as the share-price endpoint.
+	if !h.requireVaultOwner(w, r, vaultID) {
 		return
 	}
 
