@@ -82,9 +82,16 @@ type ConvertResponse struct {
 // Implementations invoke the Soroban vault contract; the noop is used when
 // no operator secret is configured.
 type VaultDepositInvoker interface {
+	// DepositToVault takes an ASSET amount in stroops (1 unit = 10^7).
 	DepositToVault(ctx context.Context, contractAddress string, amountStroops int64) error
+	// WithdrawFromVault takes a SHARE amount in stroops, NOT assets: the
+	// value is forwarded to preview_withdraw_net and to the contract's
+	// share-denominated withdraw. Callers holding an asset amount must
+	// convert it first — see resolveWithdrawalShares (nester#1151).
 	WithdrawFromVault(ctx context.Context, contractAddress string, sharesStroops int64, slippageBps int) (txHash string, err error)
+	// PreviewDeposit maps ASSET stroops in to SHARE stroops out.
 	PreviewDeposit(ctx context.Context, contractAddress string, amountStroops int64) (int64, error)
+	// PreviewWithdraw maps SHARE stroops in to ASSET stroops out.
 	PreviewWithdraw(ctx context.Context, contractAddress string, sharesStroops int64) (int64, error)
 	HarvestVault(ctx context.Context, contractAddress, userAddress string, compound bool) (string, error)
 	// EmergencyWithdrawAll triggers the vault contract's emergency_withdraw_all
@@ -125,8 +132,12 @@ type HarvestResult struct {
 }
 
 type VaultService struct {
-	repository             vault.Repository
-	depositInvoker         VaultDepositInvoker
+	repository     vault.Repository
+	depositInvoker VaultDepositInvoker
+	// operatorFundedDeposits gates deposits that would spend the shared
+	// operator account. A nil policy refuses them all, which is the correct
+	// default: the wallet-signed path does not need it (nester#1152).
+	operatorFundedDeposits *OperatorFundedDepositPolicy
 	chainVerifier          ChainEventVerifier
 	defaultHarvestCompound bool
 	yieldRecorder          YieldHarvestRecorder
@@ -256,6 +267,13 @@ func NewVaultService(repository vault.Repository) *VaultService {
 // Call this after NewVaultService when an operator key is available.
 func (s *VaultService) SetDepositInvoker(invoker VaultDepositInvoker) {
 	s.depositInvoker = invoker
+}
+
+// SetOperatorFundedDepositPolicy installs the gate for deposits funded from
+// the shared operator account. Leaving it unset refuses every such deposit
+// (nester#1152).
+func (s *VaultService) SetOperatorFundedDepositPolicy(policy *OperatorFundedDepositPolicy) {
+	s.operatorFundedDeposits = policy
 }
 
 // ChainEventVerifier looks up a transaction hash and returns the matching
@@ -418,6 +436,20 @@ func (s *VaultService) RecordDeposit(ctx context.Context, input RecordDepositInp
 	}
 
 	if txHash == "" && s.depositInvoker != nil {
+		// No tx_hash means nothing was signed by the user, so this deposit
+		// would be submitted with the operator as both caller and depositing
+		// user — spending platform funds on the caller's behalf. Without a
+		// gate that made POST /vaults/{id}/deposit a value transfer bounded
+		// only by the operator's balance (nester#1152).
+		//
+		// The supported path is the wallet-signed one: the client signs its
+		// own deposit and supplies the tx_hash, which the chain verifier
+		// checks below. Anything else has to be explicitly allowlisted,
+		// capped, and audit-logged.
+		if err := s.operatorFundedDeposits.Authorize(ctx, input.VaultID, userID, input.Amount); err != nil {
+			return vault.Vault{}, err
+		}
+
 		stroops := input.Amount.Mul(decimal.NewFromInt(10_000_000)).Round(0).IntPart()
 		if err := s.depositInvoker.DepositToVault(ctx, existing.ContractAddress, stroops); err != nil {
 			if strings.Contains(err.Error(), "#21") {
@@ -714,15 +746,35 @@ func (s *VaultService) RecordWithdrawal(ctx context.Context, input RecordWithdra
 	}
 
 	txHash := strings.TrimSpace(input.TxHash)
+	// Shares actually burned on chain, when this call submitted the
+	// transaction itself. Zero means "not known from a submission" and the
+	// share figure falls back to the share-price computation below.
+	submittedShares := decimal.Zero
 	// A client-supplied hash means the withdraw already landed on-chain
 	// (wallet-signed). Do not submit again.
 	if txHash == "" && s.depositInvoker != nil {
-		stroops := input.Amount.Mul(decimal.NewFromInt(10_000_000)).Round(0).IntPart()
-		submitted, err := s.depositInvoker.WithdrawFromVault(ctx, existing.ContractAddress, stroops, input.SlippageBps)
+		// WithdrawFromVault's second parameter is SHARES in stroops, not
+		// assets: it is forwarded to preview_withdraw_net and to the
+		// contract's share-denominated withdraw. Passing asset stroops here
+		// burned the wrong number of shares whenever the share price was not
+		// exactly 1.0 — taking materially more or less than the user asked
+		// for, while the database recorded the requested amount either way
+		// (nester#1151).
+		sharesStroops, err := s.resolveWithdrawalShares(ctx, existing, input.Amount)
+		if err != nil {
+			return vault.Vault{}, err
+		}
+
+		submitted, err := s.depositInvoker.WithdrawFromVault(ctx, existing.ContractAddress, sharesStroops, input.SlippageBps)
 		if err != nil {
 			return vault.Vault{}, fmt.Errorf("on-chain withdrawal failed: %w", err)
 		}
 		txHash = strings.TrimSpace(submitted)
+		// The contract burned sharesStroops and returned the corresponding
+		// assets. Record what the chain actually did rather than what was
+		// requested; when a verifier is configured the block below replaces
+		// this with the emitted event, which is better still.
+		submittedShares = decimal.NewFromInt(sharesStroops).Div(stroopsPerUnit)
 	}
 
 	amount := input.Amount
@@ -751,6 +803,12 @@ func (s *VaultService) RecordWithdrawal(ctx context.Context, input RecordWithdra
 
 	sharePrice := vault.ComputeSharePrice(existing)
 	shares := amount.Div(sharePrice).Round(6)
+	// Prefer the share count the chain actually burned over one re-derived
+	// from the price: the recorded withdrawal must reflect what happened on
+	// chain, not what was requested (nester#1151).
+	if submittedShares.IsPositive() {
+		shares = submittedShares.Round(6)
+	}
 
 	record := vault.TransactionRecord{
 		UserID:               userID,
@@ -765,6 +823,69 @@ func (s *VaultService) RecordWithdrawal(ctx context.Context, input RecordWithdra
 	}
 
 	return s.repository.GetVault(ctx, input.VaultID)
+}
+
+// stroopsPerUnit is the fixed-point scale Soroban uses for asset and share
+// amounts: 1 unit = 10^7 stroops.
+var stroopsPerUnit = decimal.NewFromInt(10_000_000)
+
+// resolveWithdrawalShares converts a requested ASSET amount into the SHARE
+// amount, in stroops, to burn on chain.
+//
+// The contract's withdraw is share-denominated, so a user asking to take out
+// 100 USDC from a vault whose shares are worth 1.25 USDC each must burn 80
+// shares, not 100. Passing the asset figure straight through was the bug this
+// fixes (nester#1151).
+//
+// Two steps, because neither alone is sufficient:
+//
+//  1. Convert at the vault's current share price. This is a local estimate
+//     derived from recorded balances.
+//  2. Refine it against the contract's own preview_withdraw, which is
+//     authoritative and accounts for fees the local price does not model. One
+//     correction is applied by scaling the estimate by the ratio of requested
+//     to previewed assets; a second preview is not worth the extra round trip,
+//     and the slippage guard inside WithdrawFromVault is what ultimately
+//     bounds the result.
+//
+// When the preview is unavailable the share-price estimate stands on its own:
+// failing the withdrawal outright would make an unreachable read-only RPC
+// block users from their funds, and the on-chain slippage guard still bounds
+// what a mis-estimate can cost.
+func (s *VaultService) resolveWithdrawalShares(
+	ctx context.Context,
+	existing vault.Vault,
+	assetAmount decimal.Decimal,
+) (int64, error) {
+	sharePrice := vault.ComputeSharePrice(existing)
+	if sharePrice.Sign() <= 0 {
+		return 0, vault.ErrInvalidSharePrice
+	}
+
+	shares := assetAmount.Div(sharePrice)
+	sharesStroops := shares.Mul(stroopsPerUnit).Round(0).IntPart()
+	if sharesStroops <= 0 {
+		return 0, vault.ErrInvalidAmount
+	}
+
+	previewedStroops, err := s.depositInvoker.PreviewWithdraw(ctx, existing.ContractAddress, sharesStroops)
+	if err != nil || previewedStroops <= 0 {
+		// Preview unavailable (or a noop invoker, which returns zero): the
+		// share-price estimate is the best available answer.
+		return sharesStroops, nil
+	}
+
+	previewedAssets := decimal.NewFromInt(previewedStroops)
+	requestedAssets := assetAmount.Mul(stroopsPerUnit)
+	corrected := decimal.NewFromInt(sharesStroops).
+		Mul(requestedAssets).
+		Div(previewedAssets).
+		Round(0).
+		IntPart()
+	if corrected <= 0 {
+		return sharesStroops, nil
+	}
+	return corrected, nil
 }
 
 // DeleteVault soft-deletes a vault so it is excluded from future reads.

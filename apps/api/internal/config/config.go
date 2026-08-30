@@ -242,6 +242,17 @@ type StellarConfig struct {
 	allocationStrategyAddress string
 	withdrawalSlippageBps     int
 	harvestDefaultCompound    bool
+	// operatorFundedDepositsEnabled allows the API to fund deposits from the
+	// shared operator account when the user did not sign one themselves.
+	// Off by default: the supported path is a wallet-signed deposit, and
+	// leaving this on makes the deposit endpoint a value transfer bounded
+	// only by the operator balance (nester#1152).
+	operatorFundedDepositsEnabled bool
+	// operatorFundedDepositVaults is the comma-separated allowlist of vault
+	// IDs permitted to use operator funds. Empty means none.
+	operatorFundedDepositVaults string
+	// operatorFundedDepositMaxAmount caps a single operator-funded deposit.
+	operatorFundedDepositMaxAmount string
 }
 
 type AllocationConfig struct {
@@ -335,17 +346,20 @@ func Load() (*Config, error) {
 			connectionTimeout: loader.durationDefault("DATABASE_CONNECTION_TIMEOUT", 5*time.Second),
 		},
 		stellar: StellarConfig{
-			networkPassphrase:         loader.requiredString("STELLAR_NETWORK_PASSPHRASE"),
-			rpcURL:                    loader.requiredURL("STELLAR_RPC_URL"),
-			horizonURL:                loader.requiredURL("STELLAR_HORIZON_URL"),
-			operatorSecret:            loader.stringDefault("STELLAR_OPERATOR_SECRET", ""),
-			operatorAddress:           loader.stringDefault("STELLAR_OPERATOR_ADDRESS", ""),
-			signerSocketPath:          loader.stringDefault("SIGNER_SOCKET_PATH", ""),
-			stellarUSDCIssuer:         loader.stringDefault("STELLAR_USDC_ISSUER", "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"),
-			yieldRegistryContract:     loader.stringDefault("YIELD_REGISTRY_CONTRACT", ""),
-			allocationStrategyAddress: loader.stringDefault("STELLAR_ALLOCATION_STRATEGY_ADDRESS", ""),
-			withdrawalSlippageBps:     loader.intDefault("WITHDRAWAL_SLIPPAGE_BPS", 50),
-			harvestDefaultCompound:    loader.boolDefault("HARVEST_DEFAULT_COMPOUND", true),
+			networkPassphrase:              loader.requiredString("STELLAR_NETWORK_PASSPHRASE"),
+			rpcURL:                         loader.requiredURL("STELLAR_RPC_URL"),
+			horizonURL:                     loader.requiredURL("STELLAR_HORIZON_URL"),
+			operatorSecret:                 loader.stringDefault("STELLAR_OPERATOR_SECRET", ""),
+			operatorFundedDepositsEnabled:  loader.boolDefault("STELLAR_OPERATOR_FUNDED_DEPOSITS_ENABLED", false),
+			operatorFundedDepositVaults:    loader.stringDefault("STELLAR_OPERATOR_FUNDED_DEPOSIT_VAULTS", ""),
+			operatorFundedDepositMaxAmount: loader.stringDefault("STELLAR_OPERATOR_FUNDED_DEPOSIT_MAX_AMOUNT", "0"),
+			operatorAddress:                loader.stringDefault("STELLAR_OPERATOR_ADDRESS", ""),
+			signerSocketPath:               loader.stringDefault("SIGNER_SOCKET_PATH", ""),
+			stellarUSDCIssuer:              loader.stringDefault("STELLAR_USDC_ISSUER", "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"),
+			yieldRegistryContract:          loader.stringDefault("YIELD_REGISTRY_CONTRACT", ""),
+			allocationStrategyAddress:      loader.stringDefault("STELLAR_ALLOCATION_STRATEGY_ADDRESS", ""),
+			withdrawalSlippageBps:          loader.intDefault("WITHDRAWAL_SLIPPAGE_BPS", 50),
+			harvestDefaultCompound:         loader.boolDefault("HARVEST_DEFAULT_COMPOUND", true),
 		},
 		intelligence: IntelligenceConfig{
 			baseURL:       loader.stringDefault("INTELLIGENCE_BASE_URL", loader.stringDefault("INTELLIGENCE_SERVICE_URL", "http://localhost:8000")),
@@ -994,6 +1008,30 @@ func (c *Config) validate(loader *envLoader) {
 		loader.addError("AUTH_JWT_SECRET has insufficient entropy: use at least 8 distinct characters")
 	}
 
+	// NESTER_SERVICE_API_KEY authenticates service-to-service callers and is
+	// shared between them, so a weak value is a shared weak value. It stays
+	// optional, but a key that is set must be a real one (nester#1149).
+	//
+	// Absence is not treated as a failure: an empty key disables service auth
+	// outright (the middleware's `serviceAPIKey != ""` guard), which is the
+	// safest configuration rather than a weak one. Requiring the key to exist
+	// would force every deployment that does not use service-to-service auth
+	// to invent a secret it never uses. A key that IS set, however, must be a
+	// real one in every environment — a weak shared key is weak everywhere.
+	if serviceKey := strings.TrimSpace(c.auth.serviceAPIKey); serviceKey != "" {
+		if len(serviceKey) < 32 {
+			loader.addError("NESTER_SERVICE_API_KEY must be at least 32 characters")
+		}
+		if !jwtSecretHasAdequateEntropy(serviceKey) {
+			loader.addError("NESTER_SERVICE_API_KEY has insufficient entropy: use at least 8 distinct characters")
+		}
+		// Reusing the JWT secret would let any holder of the service key mint
+		// arbitrary user tokens outright, making every other control moot.
+		if serviceKey == strings.TrimSpace(c.auth.secret) {
+			loader.addError("NESTER_SERVICE_API_KEY must not reuse AUTH_JWT_SECRET")
+		}
+	}
+
 	if c.auth.accessTokenExpiry <= 0 {
 		loader.addError("AUTH_ACCESS_TOKEN_EXPIRY must be greater than 0")
 	}
@@ -1244,6 +1282,22 @@ func (s StellarConfig) HorizonURL() string {
 
 func (s StellarConfig) OperatorSecret() string {
 	return s.operatorSecret
+}
+
+// OperatorFundedDepositsEnabled reports whether the API may spend operator
+// funds on a user's behalf. Off unless explicitly enabled (nester#1152).
+func (s StellarConfig) OperatorFundedDepositsEnabled() bool {
+	return s.operatorFundedDepositsEnabled
+}
+
+// OperatorFundedDepositVaults is the raw comma-separated vault allowlist.
+func (s StellarConfig) OperatorFundedDepositVaults() string {
+	return s.operatorFundedDepositVaults
+}
+
+// OperatorFundedDepositMaxAmount caps a single operator-funded deposit.
+func (s StellarConfig) OperatorFundedDepositMaxAmount() string {
+	return s.operatorFundedDepositMaxAmount
 }
 
 // OperatorAddress returns the operator's public Stellar address. It is public

@@ -413,6 +413,34 @@ func run() error {
 		baseLogger.Info("no signing configured: chain write operations are unavailable")
 	}
 
+	// Operator-funded deposits (nester#1152).
+	//
+	// A deposit with no user-signed tx_hash is submitted with the operator as
+	// both caller and depositing user, so it spends platform funds on the
+	// caller's behalf. Disabled unless explicitly configured, and even then
+	// only for allowlisted vaults under a per-deposit cap, with every use
+	// logged. A nil policy would refuse everything, but it is always
+	// installed so the refusals are logged rather than silent.
+	operatorFundedVaults, err := service.ParseOperatorFundedVaultIDs(cfg.Stellar().OperatorFundedDepositVaults())
+	if err != nil {
+		return fmt.Errorf("parse operator-funded deposit allowlist: %w", err)
+	}
+	operatorFundedCap, err := decimal.NewFromString(cfg.Stellar().OperatorFundedDepositMaxAmount())
+	if err != nil {
+		return fmt.Errorf("parse operator-funded deposit cap: %w", err)
+	}
+	vaultService.SetOperatorFundedDepositPolicy(service.NewOperatorFundedDepositPolicy(
+		cfg.Stellar().OperatorFundedDepositsEnabled(),
+		operatorFundedVaults,
+		operatorFundedCap,
+		baseLogger.WithGroup("operator-funded-deposits"),
+	))
+	if cfg.Stellar().OperatorFundedDepositsEnabled() {
+		baseLogger.Warn("operator-funded deposits are ENABLED: the API can spend platform funds on a user's behalf",
+			"allowlisted_vaults", len(operatorFundedVaults),
+			"per_deposit_cap", operatorFundedCap.String())
+	}
+
 	if cfg.Stellar().RPCURL() != "" {
 		vaultService.SetChainEventVerifier(service.NewStellarChainEventVerifier(cfg.Stellar().RPCURL()))
 	}
