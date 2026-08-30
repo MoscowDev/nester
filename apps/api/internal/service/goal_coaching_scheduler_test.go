@@ -168,7 +168,7 @@ func TestGoalCoachingScheduler_SkipsGoalWhenUserOptedOut(t *testing.T) {
 	client := &fakeGoalCoachingClient{resp: &intelligence.CoachingResponse{ProgressAssessment: "should not be sent"}}
 
 	scheduler := NewGoalCoachingScheduler(
-		fakeGoalCoachingRepo{goals: []savingsgoal.SavingsGoal{goal}},
+		&fakeGoalCoachingRepo{goals: []savingsgoal.SavingsGoal{goal}},
 		client,
 		dispatcher,
 		nil,
@@ -193,7 +193,7 @@ func TestGoalCoachingScheduler_PassesOptOutFlagThroughToIntelligenceRequest(t *t
 	}
 
 	scheduler := NewGoalCoachingScheduler(
-		fakeGoalCoachingRepo{goals: []savingsgoal.SavingsGoal{goal}},
+		&fakeGoalCoachingRepo{goals: []savingsgoal.SavingsGoal{goal}},
 		client,
 		dispatcher,
 		nil,
