@@ -1151,14 +1151,6 @@ func (c *Config) validate(loader *envLoader) {
 	if c.allocation.minWeightPercent < 1 || c.allocation.minWeightPercent > 100 {
 		loader.addError("MIN_ALLOCATION_WEIGHT must be between 1 and 100")
 	}
-
-	// Require at least one payment provider key in production/staging so
-	// offramp features (bank list, account resolution) work at deploy time
-	// rather than failing silently when a user first triggers them.
-	if (c.environment == "production" || c.environment == "staging") &&
-		c.bank.paystackKey == "" && c.bank.flutterwaveKey == "" {
-		loader.addError("at least one of PAYSTACK_SECRET_KEY or FLUTTERWAVE_SECRET_KEY must be set in production")
-	}
 }
 
 func validateAllowedOrigins(environment string, origins []string, loader *envLoader) {
