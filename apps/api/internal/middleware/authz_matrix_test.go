@@ -61,7 +61,6 @@ var authzMatrix = []AuthzRoute{
 	// ── Vaults ───────────────────────────────────────────────────────────
 	{Method: "POST", Path: "/api/v1/vaults"},
 	{Method: "GET", Path: "/api/v1/vaults"},
-	{Method: "GET", Path: "/api/v1/vaults/all"},
 	{Method: "GET", Path: "/api/v1/vaults/00000000-0000-0000-0000-000000000000"},
 	{Method: "POST", Path: "/api/v1/vaults/00000000-0000-0000-0000-000000000000/deposit"},
 	{Method: "POST", Path: "/api/v1/vaults/00000000-0000-0000-0000-000000000000/withdraw"},
