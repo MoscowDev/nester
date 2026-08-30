@@ -994,6 +994,30 @@ func (c *Config) validate(loader *envLoader) {
 		loader.addError("AUTH_JWT_SECRET has insufficient entropy: use at least 8 distinct characters")
 	}
 
+	// NESTER_SERVICE_API_KEY authenticates service-to-service callers and is
+	// shared between them, so a weak value is a shared weak value. It stays
+	// optional, but a key that is set must be a real one (nester#1149).
+	//
+	// Absence is not treated as a failure: an empty key disables service auth
+	// outright (the middleware's `serviceAPIKey != ""` guard), which is the
+	// safest configuration rather than a weak one. Requiring the key to exist
+	// would force every deployment that does not use service-to-service auth
+	// to invent a secret it never uses. A key that IS set, however, must be a
+	// real one in every environment — a weak shared key is weak everywhere.
+	if serviceKey := strings.TrimSpace(c.auth.serviceAPIKey); serviceKey != "" {
+		if len(serviceKey) < 32 {
+			loader.addError("NESTER_SERVICE_API_KEY must be at least 32 characters")
+		}
+		if !jwtSecretHasAdequateEntropy(serviceKey) {
+			loader.addError("NESTER_SERVICE_API_KEY has insufficient entropy: use at least 8 distinct characters")
+		}
+		// Reusing the JWT secret would let any holder of the service key mint
+		// arbitrary user tokens outright, making every other control moot.
+		if serviceKey == strings.TrimSpace(c.auth.secret) {
+			loader.addError("NESTER_SERVICE_API_KEY must not reuse AUTH_JWT_SECRET")
+		}
+	}
+
 	if c.auth.accessTokenExpiry <= 0 {
 		loader.addError("AUTH_ACCESS_TOKEN_EXPIRY must be greater than 0")
 	}
