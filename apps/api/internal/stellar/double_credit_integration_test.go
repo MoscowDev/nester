@@ -83,7 +83,10 @@ func TestAPIDepositThenIndexedEvent_CreditsExactlyOnce(t *testing.T) {
 	seedDoubleCreditVault(t, db)
 
 	const txHash = "0d1e2f3a4b5c6d7e8f90112233445566778899aabbccddeeff00112233445566"
+	// The API path stores asset units; a contract event carries stroops for
+	// the same movement (nester#1146). Both must resolve to one credit.
 	const amount = "100"
+	const amountStroops = "1000000000"
 
 	// 1. The user records the deposit through the API.
 	repo := postgres.NewVaultRepository(db)
@@ -110,7 +113,7 @@ func TestAPIDepositThenIndexedEvent_CreditsExactlyOnce(t *testing.T) {
 		EventType:  "deposit",
 		Ledger:     4242,
 		TxHash:     txHash,
-		Data:       map[string]any{"amount": amount},
+		Data:       map[string]any{"amount": amountStroops},
 	})
 	if err != nil {
 		t.Fatalf("applyIndexedEvent: %v", err)
@@ -141,6 +144,7 @@ func TestIndexedEventThenAPIDeposit_CreditsExactlyOnce(t *testing.T) {
 
 	const txHash = "aabbccddeeff00112233445566778899aabbccddeeff001122334455667788990"
 	const amount = "250"
+	const amountStroops = "2500000000"
 
 	processed, err := applyIndexedEvent(context.Background(), db, indexedEvent{
 		ID:         "evt-indexer-first",
@@ -148,7 +152,7 @@ func TestIndexedEventThenAPIDeposit_CreditsExactlyOnce(t *testing.T) {
 		EventType:  "deposit",
 		Ledger:     4343,
 		TxHash:     txHash,
-		Data:       map[string]any{"amount": amount},
+		Data:       map[string]any{"amount": amountStroops},
 	})
 	if err != nil {
 		t.Fatalf("applyIndexedEvent: %v", err)
@@ -198,6 +202,7 @@ func TestRedeliveredEventForSameTxHash_CreditsExactlyOnce(t *testing.T) {
 
 	const txHash = "ffeeddccbbaa99887766554433221100ffeeddccbbaa998877665544332211000"
 	const amount = "40"
+	const amountStroops = "400000000"
 
 	for _, eventID := range []string{"evt-first-delivery", "evt-second-delivery"} {
 		if _, err := applyIndexedEvent(context.Background(), db, indexedEvent{
@@ -206,7 +211,7 @@ func TestRedeliveredEventForSameTxHash_CreditsExactlyOnce(t *testing.T) {
 			EventType:  "deposit",
 			Ledger:     4444,
 			TxHash:     txHash,
-			Data:       map[string]any{"amount": amount},
+			Data:       map[string]any{"amount": amountStroops},
 		}); err != nil {
 			t.Fatalf("applyIndexedEvent(%s): %v", eventID, err)
 		}

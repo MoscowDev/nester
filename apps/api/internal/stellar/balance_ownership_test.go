@@ -23,7 +23,8 @@ func TestApplyIndexedEvent_Deposit_AlreadyClaimedHash_DoesNotCredit(t *testing.T
 		EventType:  "deposit",
 		Ledger:     900,
 		TxHash:     "hash-already-credited",
-		Data:       map[string]any{"amount": "10"},
+		// Stroops, as the contract emits them: 10 asset units (nester#1146).
+		Data: map[string]any{"amount": "100000000"},
 	}
 
 	mock.ExpectBegin()
@@ -55,7 +56,8 @@ func TestApplyIndexedEvent_Deposit_UnclaimedHash_Credits(t *testing.T) {
 		EventType:  "deposit",
 		Ledger:     901,
 		TxHash:     "hash-not-yet-seen",
-		Data:       map[string]any{"amount": "10"},
+		// Stroops, as the contract emits them: 10 asset units (nester#1146).
+		Data: map[string]any{"amount": "100000000"},
 	}
 
 	mock.ExpectBegin()
@@ -89,7 +91,8 @@ func TestApplyIndexedEvent_Deposit_NoTxHash_CreditsWithoutClaiming(t *testing.T)
 		ContractID: "C1",
 		EventType:  "deposit",
 		Ledger:     902,
-		Data:       map[string]any{"amount": "7"},
+		// 7 asset units in stroops.
+		Data: map[string]any{"amount": "70000000"},
 	}
 
 	mock.ExpectBegin()
@@ -121,7 +124,8 @@ func TestApplyIndexedEvent_Withdraw_AlreadyClaimedHash_DoesNotDebit(t *testing.T
 		EventType:  "withdraw",
 		Ledger:     903,
 		TxHash:     "wd-hash-already-applied",
-		Data:       map[string]any{"amount": "3"},
+		// 3 asset units in stroops.
+		Data: map[string]any{"amount": "30000000"},
 	}
 
 	mock.ExpectBegin()
