@@ -277,6 +277,12 @@ func run() error {
 	// Balance is moved only after a deposit/withdrawal is confirmed on-chain
 	// (issue #496); the vault repository applies it idempotently by tx hash.
 	transactionService.SetBalanceApplier(vaultRepository)
+	// A successful hash is not proof it paid this vault. The lookup supplies
+	// the vault's real contract address and currency so a confirmation is
+	// checked against the transaction's actual operations, and the credited
+	// amount is taken from the chain rather than the request body
+	// (nester#1145).
+	transactionService.SetVaultLookup(vaultRepository)
 	transactionHandler := handler.NewTransactionHandler(transactionService)
 	transactionHandler.SetVaultRepository(vaultRepository)
 
