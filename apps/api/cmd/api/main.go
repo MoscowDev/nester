@@ -1379,6 +1379,28 @@ func run() error {
 		},
 		"authentication rate limit exceeded",
 	)
+	// authGuard hardens the same handshake beyond request rate (nester#1104):
+	// a per-wallet limit (the limiter above keys only on IP, so a distributed
+	// client could flood the challenge store for one wallet without tripping
+	// it), and a progressive lockout on repeated FAILURES tracked per wallet
+	// and per IP. Slowing down does not evade the lockout, because the backoff
+	// escalates with the failure count rather than resetting with time.
+	authLockoutCfg := middleware.AuthLockoutConfig{
+		Threshold: cfg.RateLimit().AuthFailureThreshold(),
+		Window:    cfg.RateLimit().AuthFailureWindow(),
+		Base:      cfg.RateLimit().AuthLockoutBase(),
+		Max:       cfg.RateLimit().AuthLockoutMax(),
+	}
+	authGuard := middleware.NewAuthGuard(
+		middleware.NewLimiter(redisClient, "authwallet", cfg.RateLimit().AuthLimit(), cfg.RateLimit().AuthWindow()),
+		middleware.NewAuthLockout(redisClient, "wallet", authLockoutCfg),
+		middleware.NewAuthLockout(redisClient, "ip", authLockoutCfg),
+		appMetrics,
+		[]middleware.AuthGuardStage{
+			{Stage: metrics.AuthStageChallenge, Route: middleware.RouteMatch{Method: http.MethodPost, Path: "/api/v1/auth/challenge"}},
+			{Stage: metrics.AuthStageVerify, Route: middleware.RouteMatch{Method: http.MethodPost, Path: "/api/v1/auth/verify"}},
+		},
+	).Middleware()
 	// settlementLimiter applies a strict per-user limit to settlement creation to
 	// prevent settlement spam. Placed after authentication so it keys by user ID.
 	settlementLimiter := middleware.SensitiveUserRouteLimiter(
@@ -1487,19 +1509,24 @@ func run() error {
 						middleware.IndexerFreshness(indexerFreshness)(
 							globalLimiter(
 								authRouteLimiter(
-									writeLimiter(
-										authenticator(
-											walletBinding(
-												idempotencyMiddleware(
-													costQuota(
-														settlementLimiter(
-															walletLimiter(
-																middleware.LimitRequestBody(1 * 1024 * 1024)(
-																	middleware.Logging(baseLogger)(
-																		middleware.Tracing(
-																			cfg.Tracing().ServiceName(),
-																			cfg.Tracing().LatencyThreshold(),
-																		)(mux),
+									// Inside the per-IP limiter so an already
+									// rate-limited request never reaches the
+									// lockout bookkeeping (nester#1104).
+									authGuard(
+										writeLimiter(
+											authenticator(
+												walletBinding(
+													idempotencyMiddleware(
+														costQuota(
+															settlementLimiter(
+																walletLimiter(
+																	middleware.LimitRequestBody(1 * 1024 * 1024)(
+																		middleware.Logging(baseLogger)(
+																			middleware.Tracing(
+																				cfg.Tracing().ServiceName(),
+																				cfg.Tracing().LatencyThreshold(),
+																			)(mux),
+																		),
 																	),
 																),
 															),

@@ -264,19 +264,26 @@ type AuthConfig struct {
 }
 
 type RateLimitConfig struct {
-	globalLimit       int
-	globalWindow      time.Duration
-	writeLimit        int
-	writeWindow       time.Duration
-	walletLimit       int
-	walletWindow      time.Duration
-	rebalanceLimit    int
-	rebalanceWindow   time.Duration
-	authLimit         int
-	authWindow        time.Duration
-	settlementLimit   int
-	settlementWindow  time.Duration
-	trustedProxyCount int
+	globalLimit     int
+	globalWindow    time.Duration
+	writeLimit      int
+	writeWindow     time.Duration
+	walletLimit     int
+	walletWindow    time.Duration
+	rebalanceLimit  int
+	rebalanceWindow time.Duration
+	authLimit       int
+	authWindow      time.Duration
+	// Auth-failure lockout (nester#1104). Distinct from authLimit/authWindow,
+	// which bound request *rate*; these bound repeated *failures* and escalate
+	// a backoff the attacker cannot outrun by slowing down.
+	authFailureThreshold int
+	authFailureWindow    time.Duration
+	authLockoutBase      time.Duration
+	authLockoutMax       time.Duration
+	settlementLimit      int
+	settlementWindow     time.Duration
+	trustedProxyCount    int
 
 	// Cost-weighted quota (see middleware.CostQuota). This meters downstream
 	// work per user rather than request count, so an expensive route can be
@@ -377,16 +384,26 @@ func Load() (*Config, error) {
 			challengeExpiry:         loader.durationDefault("AUTH_CHALLENGE_EXPIRY", 5*time.Minute),
 		},
 		rateLimit: RateLimitConfig{
-			globalLimit:       loader.intDefault("RATELIMIT_GLOBAL_LIMIT", 100),
-			globalWindow:      loader.durationDefault("RATELIMIT_GLOBAL_WINDOW", 1*time.Minute),
-			writeLimit:        loader.intDefault("RATELIMIT_WRITE_LIMIT", 20),
-			writeWindow:       loader.durationDefault("RATELIMIT_WRITE_WINDOW", 1*time.Minute),
-			walletLimit:       loader.intDefault("RATELIMIT_WALLET_LIMIT", 60),
-			walletWindow:      loader.durationDefault("RATELIMIT_WALLET_WINDOW", 1*time.Minute),
-			rebalanceLimit:    loader.intDefault("RATELIMIT_REBALANCE_LIMIT", 3),
-			rebalanceWindow:   loader.durationDefault("RATELIMIT_REBALANCE_WINDOW", 1*time.Hour),
-			authLimit:         loader.intDefault("RATELIMIT_AUTH_LIMIT", 10),
-			authWindow:        loader.durationDefault("RATELIMIT_AUTH_WINDOW", 1*time.Minute),
+			globalLimit:     loader.intDefault("RATELIMIT_GLOBAL_LIMIT", 100),
+			globalWindow:    loader.durationDefault("RATELIMIT_GLOBAL_WINDOW", 1*time.Minute),
+			writeLimit:      loader.intDefault("RATELIMIT_WRITE_LIMIT", 20),
+			writeWindow:     loader.durationDefault("RATELIMIT_WRITE_WINDOW", 1*time.Minute),
+			walletLimit:     loader.intDefault("RATELIMIT_WALLET_LIMIT", 60),
+			walletWindow:    loader.durationDefault("RATELIMIT_WALLET_WINDOW", 1*time.Minute),
+			rebalanceLimit:  loader.intDefault("RATELIMIT_REBALANCE_LIMIT", 3),
+			rebalanceWindow: loader.durationDefault("RATELIMIT_REBALANCE_WINDOW", 1*time.Hour),
+			authLimit:       loader.intDefault("RATELIMIT_AUTH_LIMIT", 10),
+			authWindow:      loader.durationDefault("RATELIMIT_AUTH_WINDOW", 1*time.Minute),
+			// 5 failures in 15 minutes starts the backoff. A legitimate user
+			// retrying a flaky wallet signature stays well under it; a
+			// signature brute-force does not.
+			authFailureThreshold: loader.intDefault("AUTH_FAILURE_THRESHOLD", 5),
+			authFailureWindow:    loader.durationDefault("AUTH_FAILURE_WINDOW", 15*time.Minute),
+			// Doubling from 30s, capped at 15m: the 6th failure locks for 30s,
+			// the 7th for 1m, and so on. The cap keeps a wallet from being
+			// locked out indefinitely by someone else spamming its address.
+			authLockoutBase:   loader.durationDefault("AUTH_LOCKOUT_BASE", 30*time.Second),
+			authLockoutMax:    loader.durationDefault("AUTH_LOCKOUT_MAX", 15*time.Minute),
 			settlementLimit:   loader.intDefault("RATELIMIT_SETTLEMENT_LIMIT", 5),
 			settlementWindow:  loader.durationDefault("RATELIMIT_SETTLEMENT_WINDOW", 1*time.Minute),
 			trustedProxyCount: loader.intDefault("RATELIMIT_TRUSTED_PROXY_COUNT", 0),
@@ -1056,6 +1073,18 @@ func (c *Config) validate(loader *envLoader) {
 	} else if c.rateLimit.authWindow < time.Millisecond {
 		loader.addError("RATELIMIT_AUTH_WINDOW must be at least 1ms")
 	}
+	if c.rateLimit.authFailureThreshold <= 0 {
+		loader.addError("AUTH_FAILURE_THRESHOLD must be greater than 0")
+	}
+	if c.rateLimit.authFailureWindow <= 0 {
+		loader.addError("AUTH_FAILURE_WINDOW must be greater than 0")
+	}
+	if c.rateLimit.authLockoutBase <= 0 {
+		loader.addError("AUTH_LOCKOUT_BASE must be greater than 0")
+	}
+	if c.rateLimit.authLockoutMax < c.rateLimit.authLockoutBase {
+		loader.addError("AUTH_LOCKOUT_MAX must be at least AUTH_LOCKOUT_BASE")
+	}
 	if c.rateLimit.settlementLimit <= 0 {
 		loader.addError("RATELIMIT_SETTLEMENT_LIMIT must be greater than 0")
 	}
@@ -1354,6 +1383,28 @@ func (r RateLimitConfig) AuthLimit() int {
 
 func (r RateLimitConfig) AuthWindow() time.Duration {
 	return r.authWindow
+}
+
+// AuthFailureThreshold is how many failures inside AuthFailureWindow are
+// tolerated before lockouts begin (nester#1104).
+func (r RateLimitConfig) AuthFailureThreshold() int {
+	return r.authFailureThreshold
+}
+
+// AuthFailureWindow is the sliding period over which auth failures accumulate.
+func (r RateLimitConfig) AuthFailureWindow() time.Duration {
+	return r.authFailureWindow
+}
+
+// AuthLockoutBase is the first lockout duration; it doubles per failure beyond
+// the threshold.
+func (r RateLimitConfig) AuthLockoutBase() time.Duration {
+	return r.authLockoutBase
+}
+
+// AuthLockoutMax caps the progressive backoff.
+func (r RateLimitConfig) AuthLockoutMax() time.Duration {
+	return r.authLockoutMax
 }
 
 func (r RateLimitConfig) SettlementLimit() int {
