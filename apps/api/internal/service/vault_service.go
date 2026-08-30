@@ -132,8 +132,12 @@ type HarvestResult struct {
 }
 
 type VaultService struct {
-	repository             vault.Repository
-	depositInvoker         VaultDepositInvoker
+	repository     vault.Repository
+	depositInvoker VaultDepositInvoker
+	// operatorFundedDeposits gates deposits that would spend the shared
+	// operator account. A nil policy refuses them all, which is the correct
+	// default: the wallet-signed path does not need it (nester#1152).
+	operatorFundedDeposits *OperatorFundedDepositPolicy
 	chainVerifier          ChainEventVerifier
 	defaultHarvestCompound bool
 	yieldRecorder          YieldHarvestRecorder
@@ -263,6 +267,13 @@ func NewVaultService(repository vault.Repository) *VaultService {
 // Call this after NewVaultService when an operator key is available.
 func (s *VaultService) SetDepositInvoker(invoker VaultDepositInvoker) {
 	s.depositInvoker = invoker
+}
+
+// SetOperatorFundedDepositPolicy installs the gate for deposits funded from
+// the shared operator account. Leaving it unset refuses every such deposit
+// (nester#1152).
+func (s *VaultService) SetOperatorFundedDepositPolicy(policy *OperatorFundedDepositPolicy) {
+	s.operatorFundedDeposits = policy
 }
 
 // ChainEventVerifier looks up a transaction hash and returns the matching
@@ -425,6 +436,20 @@ func (s *VaultService) RecordDeposit(ctx context.Context, input RecordDepositInp
 	}
 
 	if txHash == "" && s.depositInvoker != nil {
+		// No tx_hash means nothing was signed by the user, so this deposit
+		// would be submitted with the operator as both caller and depositing
+		// user — spending platform funds on the caller's behalf. Without a
+		// gate that made POST /vaults/{id}/deposit a value transfer bounded
+		// only by the operator's balance (nester#1152).
+		//
+		// The supported path is the wallet-signed one: the client signs its
+		// own deposit and supplies the tx_hash, which the chain verifier
+		// checks below. Anything else has to be explicitly allowlisted,
+		// capped, and audit-logged.
+		if err := s.operatorFundedDeposits.Authorize(ctx, input.VaultID, userID, input.Amount); err != nil {
+			return vault.Vault{}, err
+		}
+
 		stroops := input.Amount.Mul(decimal.NewFromInt(10_000_000)).Round(0).IntPart()
 		if err := s.depositInvoker.DepositToVault(ctx, existing.ContractAddress, stroops); err != nil {
 			if strings.Contains(err.Error(), "#21") {

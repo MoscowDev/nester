@@ -76,6 +76,11 @@ var (
 	// negative, which makes an asset/share conversion meaningless. It signals
 	// corrupted balances rather than bad user input.
 	ErrInvalidSharePrice = errors.New("vault share price is not positive")
+	// ErrOperatorFundedDepositRefused is returned when a deposit would have
+	// to be funded from the shared operator account and policy forbids it.
+	// The caller's remedy is to sign and submit the deposit from their own
+	// wallet and supply the resulting tx_hash (nester#1152).
+	ErrOperatorFundedDepositRefused = errors.New("deposits must be signed and funded by your own wallet: submit the transaction and supply its tx_hash")
 	ErrCapacityExceeded     = errors.New("deposit would exceed vault capacity limit")
 	// ErrUserCancelled is returned when a user declines the wallet signature
 	// or abandons an attempt before submission. It exists to keep that case

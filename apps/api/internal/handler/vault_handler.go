@@ -792,6 +792,12 @@ func (h *VaultHandler) writeDomainError(w http.ResponseWriter, r *http.Request, 
 	case errors.Is(err, vault.ErrInvalidSharePrice):
 		response.WriteJSON(w, http.StatusInternalServerError,
 			response.Err(http.StatusInternalServerError, "INVALID_SHARE_PRICE", err.Error()))
+	// 403, not 400: the request is well-formed and the amount is valid; the
+	// server simply refuses to fund it. The message names the remedy, which
+	// is to sign the deposit from the user wallet (nester#1152).
+	case errors.Is(err, vault.ErrOperatorFundedDepositRefused):
+		response.WriteJSON(w, http.StatusForbidden,
+			response.Err(http.StatusForbidden, "OPERATOR_FUNDED_DEPOSIT_REFUSED", err.Error()))
 	case errors.Is(err, vault.ErrInsufficientBalance), errors.Is(err, vault.ErrVaultClosed), errors.Is(err, vault.ErrVaultNotActive):
 		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr(err.Error()))
 
